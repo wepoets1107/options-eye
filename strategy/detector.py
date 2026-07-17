@@ -67,9 +67,8 @@ def detect_deviations(
                 spread_ok = True
                 if c.bid_iv and c.ask_iv:
                     iv_spread = (c.ask_iv - c.bid_iv) * 100
-                    if 0 < iv_spread < abs(dev_pt):
-                        spread_ok = True
-                    elif abs(dev_pt) < iv_spread:
+                    # 偏差达到点差一半即视为有效信号（原要求超过点差，过狠导致 71% 被过滤）
+                    if 0 < iv_spread and abs(dev_pt) < 0.5 * iv_spread:
                         spread_ok = False
                 deviations.append(IVDeviation(
                     instrument=c.instrument, currency=c.currency,
@@ -117,32 +116,32 @@ def _classify_deviation_pattern(expiry_deviations, log_mid_strike):
 
     high_conf = lambda z: abs(z) >= 2.0
 
-    # 1. 曲率检测：两翼高/低 + 近翼正常
+    # 1. 曲率检测：两翼高/低 + 近翼正常（wing 阈值放宽 1.0→0.8）
     if wing_calls and wing_puts and (near_calls or near_puts):
-        if wing_call_z > 1.0 and wing_put_z > 1.0 and abs(near_call_z) < 0.8 and abs(near_put_z) < 0.8:
+        if wing_call_z > 0.8 and wing_put_z > 0.8 and abs(near_call_z) < 0.8 and abs(near_put_z) < 0.8:
             return {"pattern": "convex", "confidence": "high" if (high_conf(wing_call_z) and high_conf(wing_put_z)) else "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
-        if wing_call_z < -1.0 and wing_put_z < -1.0 and abs(near_call_z) < 0.8 and abs(near_put_z) < 0.8:
+        if wing_call_z < -0.8 and wing_put_z < -0.8 and abs(near_call_z) < 0.8 and abs(near_put_z) < 0.8:
             return {"pattern": "concave", "confidence": "high" if (high_conf(wing_call_z) and high_conf(wing_put_z)) else "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
 
-    # 2. 整体偏高/偏低：所有合约同号
-    if all(abs(z) >= 1.5 for z in [avg_call_z, avg_put_z]) and (avg_call_z > 0) == (avg_put_z > 0):
+    # 2. 整体偏高/偏低：所有合约同号（阈值放宽 1.5→1.2）
+    if all(abs(z) >= 1.2 for z in [avg_call_z, avg_put_z]) and (avg_call_z > 0) == (avg_put_z > 0):
         z_avg = (avg_call_z + avg_put_z) / 2
         if z_avg > 0:
             return {"pattern": "overpriced", "confidence": "high" if high_conf(z_avg) else "medium", "z_avg": z_avg}
         else:
             return {"pattern": "underpriced", "confidence": "high" if high_conf(z_avg) else "medium", "z_avg": z_avg}
 
-    # 3. 偏斜检测：一侧显著高于另一侧
-    if avg_put_z > 1.5 and avg_call_z < avg_put_z - 1.5:
+    # 3. 偏斜检测：一侧显著高于另一侧（阈值 1.5→1.2，差值 1.5→1.0）
+    if avg_put_z > 1.2 and avg_call_z < avg_put_z - 1.0:
         return {"pattern": "skew_put_rich", "confidence": "high" if high_conf(avg_put_z) else "medium", "z_avg": avg_put_z}
-    if avg_call_z > 1.5 and avg_put_z < avg_call_z - 1.5:
+    if avg_call_z > 1.2 and avg_put_z < avg_call_z - 1.0:
         return {"pattern": "skew_call_rich", "confidence": "high" if high_conf(avg_call_z) else "medium", "z_avg": avg_call_z}
 
-    # 4. 兜底曲率（近翼数据不够时）
+    # 4. 兜底曲率（近翼数据不够时，阈值同步放宽 1.0→0.8）
     if wing_calls and wing_puts:
-        if wing_call_z > 1.0 and wing_put_z > 1.0:
+        if wing_call_z > 0.8 and wing_put_z > 0.8:
             return {"pattern": "convex", "confidence": "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
-        if wing_call_z < -1.0 and wing_put_z < -1.0:
+        if wing_call_z < -0.8 and wing_put_z < -0.8:
             return {"pattern": "concave", "confidence": "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
 
     return {"pattern": "none", "confidence": "low", "z_avg": 0}
@@ -186,13 +185,16 @@ def generate_signals(deviations, slices, sabr_params, z_threshold=2.0):
         pattern = _classify_deviation_pattern(devs, log_mid)
         if pattern["pattern"] == "none" or pattern["confidence"] == "low":
             continue
-        valid_devs = [d for d in devs if d.spread_filter_pass and d.oi_filter_pass]
-        if not valid_devs:
+        # 配对用全部偏差（spread 仅作评级，不硬过滤）；
+        # 至少要有 oi 达标的偏差才出信号（避免极低流动性噪音）
+        trusted = [d for d in devs if d.oi_filter_pass]
+        if not trusted:
             continue
         sabr = sabr_params.get(f"{slice_.currency}_{slice_.expiration}")
-        signal = _build_signal(pattern, valid_devs, slice_, log_mid, now, sabr)
+        # 传全部 devs 给 _build_signal，保证"有模式就能配对出腿"
+        signal = _build_signal(pattern, devs, slice_, log_mid, now, sabr)
         if signal and (pattern["confidence"] == "high" or
-                       (pattern["confidence"] == "medium" and abs(pattern["z_avg"]) >= z_threshold)):
+                       (pattern["confidence"] == "medium" and abs(pattern["z_avg"]) >= 1.2)):
             _finalize_signal(signal, slice_)
             signals.append(signal)
     return signals

@@ -135,6 +135,8 @@ async def api_deviations():
         "deviations": [
             {
                 "instrument": d.instrument,
+                "currency": d.currency,
+                "expiration": d.expiration,
                 "kind": d.kind,
                 "strike": d.strike,
                 "dte": d.dte,
@@ -143,8 +145,8 @@ async def api_deviations():
                 "deviation_pt": d.deviation_pt,
                 "z_score": d.z_score,
                 "delta": d.delta,
-                "spread_ok": d.spread_filter_pass,
-                "oi_ok": d.oi_filter_pass,
+                "spread_filter_pass": d.spread_filter_pass,
+                "oi_filter_pass": d.oi_filter_pass,
             }
             for d in devs
         ]
