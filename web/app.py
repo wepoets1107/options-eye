@@ -327,11 +327,22 @@ async def api_gl_hedge_login(cred: GlHedgeCredentials):
 
 
 @app.post("/api/gl-hedge/start")
-async def api_gl_hedge_start(currency: str = "BTC"):
+async def api_gl_hedge_start(request: Request, currency: str = "BTC"):
     gl = state.get("gl_hedge")
     if not gl:
         return {"status": "error", "message": "Not logged in"}
-    result = await gl.start_delta_hedge(currency=currency)
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    result = await gl.start_delta_hedge(
+        currency=currency,
+        coin_target_delta=float(body.get("coin_target_delta", 0)),
+        max_positive=float(body.get("max_positive", 0.5)),
+        max_negative=float(body.get("max_negative", 0.5)),
+        order_type=body.get("order_type", "taker"),
+    )
     if result.get("status") == "ok":
         pm = state.get("position_manager")
         if pm:

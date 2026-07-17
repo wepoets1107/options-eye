@@ -25,6 +25,13 @@ class Position:
         self.executed_at = int(time.time())
         self.status = "open"  # open / closed
 
+        # 入场权利金（净，币本位）。buy 为负、sell 为正。
+        self.entry_premium = float(getattr(signal, "expected_premium", 0.0) or 0.0)
+        # 盈亏（由外部基于实时 mark_price 更新）
+        self.current_premium = 0.0      # 当前平仓所需净权利金（币本位）
+        self.pnl = 0.0                  # 未实现盈亏 = entry_premium - current_premium
+        self.pnl_pct = 0.0              # 盈亏百分比
+
         # Greeks（由外部更新）
         self.net_delta = 0.0
         self.net_gamma = 0.0
@@ -51,6 +58,10 @@ class Position:
             "net_vega": round(self.net_vega, 4),
             "net_theta": round(self.net_theta, 4),
             "bartlett_delta": round(self.bartlett_delta, 4),
+            "entry_premium": round(self.entry_premium, 6),
+            "current_premium": round(self.current_premium, 6),
+            "pnl": round(self.pnl, 6),
+            "pnl_pct": round(self.pnl_pct, 2),
             "hedge_amount": round(self.hedge_amount, 4),
             "hedge_active": self.hedge_active,
             "hedge_strategy_id": self.hedge_strategy_id,
@@ -98,6 +109,7 @@ class PositionManager:
         total_vega = 0.0
         total_theta = 0.0
         total_bartlett = 0.0
+        total_premium_current = 0.0     # 当前平仓净权利金（币本位）
 
         for leg in pos.legs:
             inst = leg.get("instrument", "")
@@ -176,6 +188,10 @@ class PositionManager:
                 total_theta += leg_theta * side * amount
                 total_bartlett += bartlett * side * amount
 
+                # 当前平仓净权利金（仅期权腿，不含永续对冲腿）
+                if real_c and real_c.mark_price and real_c.mark_price > 0:
+                    total_premium_current += real_c.mark_price * amount * side
+
             except Exception as e:
                 logger.debug(f"Greeks calc error for {inst}: {e}")
 
@@ -184,11 +200,18 @@ class PositionManager:
         pos.net_vega = total_vega
         pos.net_theta = total_theta
         pos.bartlett_delta = total_bartlett
+        pos.current_premium = total_premium_current
+        if abs(pos.entry_premium) > 1e-9:
+            pos.pnl = pos.entry_premium - total_premium_current
+            pos.pnl_pct = pos.pnl / abs(pos.entry_premium) * 100.0
+        else:
+            pos.pnl = 0.0
+            pos.pnl_pct = 0.0
         pos.last_update = int(time.time())
 
     def get_net_position(self) -> dict:
         """获取所有持仓汇总"""
-        total = {"delta": 0, "gamma": 0, "vega": 0, "theta": 0, "bartlett": 0, "count": 0}
+        total = {"delta": 0, "gamma": 0, "vega": 0, "theta": 0, "bartlett": 0, "pnl": 0.0, "count": 0}
         for p in self.positions.values():
             if p.status == "open":
                 total["delta"] += p.net_delta
@@ -196,8 +219,9 @@ class PositionManager:
                 total["vega"] += p.net_vega
                 total["theta"] += p.net_theta
                 total["bartlett"] += p.bartlett_delta
+                total["pnl"] += p.pnl
                 total["count"] += 1
-        return {k: round(v, 4) if k != "count" else v for k, v in total.items()}
+        return {k: round(v, 4) if k not in ("count", "pnl") else round(v, 6) for k, v in total.items()}
 
     def get_all_positions(self) -> list[dict]:
         return [p.to_dict() for p in self.positions.values() if p.status == "open"]

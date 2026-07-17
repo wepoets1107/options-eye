@@ -3,6 +3,13 @@
 遵循语义化版本（见 `version.py`）。每次修改后递增版本号。
 Semantic versioning (see `version.py`). Bump the version after every change.
 
+## [0.7.0] - 2026-07-17
+- **前端体验优化（四块）**：
+  - IV 曲面热力图放大：单元格 `min-width 38→66`、`height 24→46`、字号 `10→13`；容器宽度上限 `1400→1860px`；新增颜色图例（绝对值 / SABR 偏差双模式）+ 异常描边图例；sticky 表头、hover 放大。
+  - 策略持仓新增 **未实现盈亏 PnL**：后端 `Position` 增加 `entry_premium/current_premium/pnl/pnl_pct`，在 `update_greeks` 中用实时 `mark_price` 计算（期权腿，不含永续对冲腿）；逐笔持仓与汇总行均红绿着色展示，附入场权利金/当前市值。
+  - 格致 Trial Forge 对冲模块新增**参数与仓位面板**：前端暴露"目标 Delta / 偏离带"输入，启动接口透传；状态面板结构化展示运行状态、币种、目标 Delta、偏离带、订单类型、对冲标的、对冲比例、启动时间。
+  - 整体打磨：顶部渐变导航、侧栏 sticky、卡片间距/圆角/配色对比、状态栏留刷新提示。
+
 ## [0.6.0] - 2026-07-17
 - **修复策略信号产出率过低（体感"空白"）**：
   - 放宽 `spread_filter_pass`：偏差达到买卖 IV 点差一半即视为有效（原要求超过点差，导致 71% 偏差被硬过滤）。
