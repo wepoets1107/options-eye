@@ -1,0 +1,628 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>期权天眼</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; color: #222; font-size: 13px; }
+.header { background: #fff; border-bottom: 1px solid #e0e0e0; padding: 10px 20px; display: flex; align-items: center; gap: 20px; }
+.header h1 { font-size: 16px; font-weight: 600; }
+.header .status { font-size: 12px; color: #666; margin-left: auto; }
+.badge { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: 500; }
+.badge-running { background: #e8f5e9; color: #2e7d32; }
+.badge-stopped { background: #fce4ec; color: #c62828; }
+.container { display: flex; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
+.sidebar { width: 280px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+.main { flex: 1; display: flex; flex-direction: column; gap: 16px; }
+.card { background: #fff; border-radius: 10px; border: 1px solid #e8e8e8; overflow: hidden; }
+.card-header { padding: 12px 16px; border-bottom: 1px solid #f0f0f0; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+.card-body { padding: 12px 16px; }
+.heatmap-controls { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.heatmap-btn { padding: 4px 12px; border-radius: 6px; border: 1px solid #ddd; background: #fff; cursor: pointer; font-size: 12px; }
+.heatmap-btn.active { background: #1565c0; color: #fff; border-color: #1565c0; }
+.heatmap-wrapper { overflow-x: auto; }
+.heatmap-table { border-collapse: collapse; font-size: 11px; }
+.heatmap-table th { padding: 4px 6px; text-align: center; font-weight: 500; color: #666; font-size: 10px; white-space: nowrap; position: sticky; top: 0; background: #fff; z-index: 1; }
+.heatmap-table td { padding: 2px; text-align: center; min-width: 38px; height: 24px; border-radius: 2px; cursor: pointer; font-size: 10px; }
+.heatmap-table td:hover { opacity: 0.8; outline: 1px solid #1565c0; outline-offset: -1px; z-index: 2; position: relative; }
+.heatmap-table td.anomaly { outline: 1px solid #e57373; outline-offset: -1px; }
+.heatmap-table td.anomaly-neg { outline: 1px solid #64b5f6; outline-offset: -1px; }
+.param-group { margin-bottom: 10px; }
+.param-label { font-size: 11px; color: #666; margin-bottom: 2px; }
+.param-row { display: flex; align-items: center; gap: 8px; }
+.param-row input[type="range"] { flex: 1; }
+.param-val { font-size: 12px; font-weight: 500; min-width: 30px; text-align: right; }
+.signal-card { padding: 10px 14px; border: 1px solid #e8e8e8; border-radius: 8px; margin-bottom: 8px; cursor: pointer; transition: background 0.15s; }
+.signal-card:hover { background: #f8f9ff; }
+.signal-card .title { font-weight: 600; font-size: 13px; margin-bottom: 4px; }
+.signal-card .sub { font-size: 11px; color: #666; }
+.signal-card .actions { display: flex; gap: 6px; margin-top: 6px; }
+.signal-card .actions button { padding: 4px 10px; border-radius: 4px; border: 1px solid #ddd; font-size: 11px; cursor: pointer; background: #fff; }
+.signal-card .actions .btn-execute { background: #1565c0; color: #fff; border-color: #1565c0; }
+.signal-card .actions .btn-ignore { color: #999; }
+.detail-panel { padding: 14px; }
+.detail-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 10px; margin: 10px 0; }
+.detail-item { }
+.detail-item .label { font-size: 10px; color: #999; }
+.detail-item .value { font-size: 14px; font-weight: 500; }
+.cred-form { display: flex; flex-direction: column; gap: 8px; }
+.cred-form input { width: 100%; padding: 8px 10px; border: 1px solid #ddd; border-radius: 6px; font-size: 12px; box-sizing: border-box; }
+.cred-form button { width: 100%; padding: 8px 14px; border-radius: 6px; border: 1px solid #1565c0; background: #1565c0; color: #fff; cursor: pointer; font-size: 12px; font-weight: 500; }
+.status-bar { display: flex; gap: 16px; padding: 8px 0; font-size: 11px; color: #888; }
+@keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.5; } 100% { opacity: 1; } }
+.loading { animation: pulse 1.5s ease-in-out infinite; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>期权天眼</h1>
+  <span id="header-status" class="badge badge-stopped">停止</span>
+  <span style="font-size:12px;color:#888;">BTC <span id="header-btc-price">--</span></span>
+  <span id="header-time" style="font-size:12px;color:#888;margin-left:auto;"></span>
+</div>
+
+<div class="container">
+  <div class="sidebar">
+    <div class="card">
+      <div class="card-header">参数面板</div>
+      <div class="card-body">
+        <div class="param-group">
+          <div class="param-label">最小 DTE</div>
+          <div class="param-row">
+            <input type="range" id="param-dte" min="1" max="60" value="7">
+            <span class="param-val" id="param-dte-val">7</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <div class="param-label">Delta 下限</div>
+          <div class="param-row">
+            <input type="range" id="param-dmin" min="1" max="30" value="5">
+            <span class="param-val" id="param-dmin-val">0.05</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <div class="param-label">Delta 上限</div>
+          <div class="param-row">
+            <input type="range" id="param-dmax" min="10" max="50" value="25">
+            <span class="param-val" id="param-dmax-val">0.25</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <div class="param-label">Z-score 阈值</div>
+          <div class="param-row">
+            <input type="range" id="param-z" min="5" max="40" value="20">
+            <span class="param-val" id="param-z-val">2.0</span>
+          </div>
+        </div>
+        <div class="param-group">
+          <div class="param-label">最小 OI</div>
+          <div class="param-row">
+            <input type="range" id="param-oi" min="0" max="100" step="5" value="10">
+            <span class="param-val" id="param-oi-val">10</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">Deribit 交易凭证</div>
+      <div class="card-body">
+        <div class="cred-form">
+          <input type="text" id="cred-id" placeholder="Client ID（测试网）">
+          <input type="password" id="cred-secret" placeholder="Client Secret">
+          <button onclick="setCredentials()">保存连接</button>
+        </div>
+        <div id="cred-status" style="font-size:11px;color:#888;margin-top:6px;"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">状态</div>
+      <div class="card-body">
+        <div class="status-bar">
+          <span>切片: <span id="stat-slices">0</span></span>
+          <span>校准: <span id="stat-cal">0</span></span>
+          <span>偏差: <span id="stat-dev">0</span></span>
+          <span>信号: <span id="stat-sig">0</span></span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="card">
+      <div class="card-header">
+        IV 曲面热力图
+        <div class="heatmap-controls" style="margin-left:auto;">
+          <button class="heatmap-btn active" onclick="switchView('abs')">IV 绝对值</button>
+          <button class="heatmap-btn" onclick="switchView('dev')">SABR 偏差</button>
+          <span style="width:1px;height:16px;background:#ddd;margin:0 4px;"></span>
+          <button class="heatmap-btn active" onclick="switchCurr('BTC')" id="curr-btc">BTC</button>
+          <button class="heatmap-btn" onclick="switchCurr('ETH')" id="curr-eth">ETH</button>
+          <span id="view-indicator" style="font-size:11px;color:#888;margin-left:8px;">红色=高IV</span>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="heatmap-wrapper" id="heatmap-container">
+          <div style="text-align:center;padding:40px;color:#999;" class="loading">等待数据...</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" id="detail-card" style="display:none;">
+      <div class="card-header">合约详情 <span id="detail-inst" style="font-weight:400;"></span></div>
+      <div class="card-body">
+        <div class="detail-grid" id="detail-grid"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">策略信号 <span id="signal-count" style="font-weight:400;color:#888;"></span></div>
+      <div class="card-body" id="signal-list">
+        <div style="text-align:center;padding:20px;color:#999;">暂无信号</div>
+      </div>
+    </div>
+
+    <!-- 策略持仓管理 -->
+    <div class="card" id="positions-card">
+      <div class="card-header">
+        策略持仓 <span id="pos-count" style="font-weight:400;color:#888;"></span>
+        <div style="margin-left:auto;display:flex;gap:6px;">
+          <button class="heatmap-btn" onclick="refreshPositions()" style="font-size:11px;">刷新</button>
+        </div>
+      </div>
+      <div class="card-body" id="positions-body">
+        <div style="text-align:center;padding:20px;color:#999;">暂无持仓</div>
+      </div>
+    </div>
+
+    <!-- 格致对冲管理 -->
+    <div class="card" id="gl-hedge-card">
+      <div class="card-header">格致 Trial Forge 对冲</div>
+      <div class="card-body">
+        <div style="display:flex;gap:8px;margin-bottom:8px;">
+          <input type="text" id="gl-email" placeholder="格致邮箱" style="flex:1;padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:12px;">
+          <input type="password" id="gl-pwd" placeholder="密码" style="flex:1;padding:6px 10px;border:1px solid #ddd;border-radius:6px;font-size:12px;">
+          <button onclick="glLogin()" style="padding:6px 14px;border-radius:6px;border:1px solid #1565c0;background:#1565c0;color:#fff;cursor:pointer;font-size:12px;">登录</button>
+        </div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;">
+          <select id="gl-currency" style="padding:4px 8px;border:1px solid #ddd;border-radius:4px;font-size:12px;">
+            <option value="BTC">BTC</option>
+            <option value="ETH">ETH</option>
+          </select>
+          <button class="heatmap-btn" onclick="glStart()">启动 Delta 对冲</button>
+          <button class="heatmap-btn" onclick="glStop()">停止对冲</button>
+          <button class="heatmap-btn" onclick="glStatus()">查询状态</button>
+        </div>
+        <div id="gl-status" style="font-size:11px;color:#888;margin-top:6px;"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- 状态 ----
+let viewMode = 'abs';
+let selectedCurr = 'BTC';
+let currentData = null;
+const NO_DATA = '等待数据...';
+
+// ---- 参数同步 ----
+['dte','dmin','dmax','z','oi'].forEach(function(k) {
+  var el = document.getElementById('param-' + k);
+  var vl = document.getElementById('param-' + k + '-val');
+  if (el && vl) {
+    el.addEventListener('input', function() {
+      if (k === 'dmin') vl.textContent = (parseInt(el.value)/100).toFixed(2);
+      else if (k === 'dmax') vl.textContent = (parseInt(el.value)/100).toFixed(2);
+      else if (k === 'z') vl.textContent = (parseInt(el.value)/10).toFixed(1);
+      else vl.textContent = el.value;
+    });
+  }
+});
+
+// ---- 数据轮询 ----
+async function fetchData() {
+  try {
+    var [stat, slices, devs, signals] = await Promise.all([
+      fetch('/api/status').then(function(r) { return r.json(); }),
+      fetch('/api/slices').then(function(r) { return r.json(); }),
+      fetch('/api/deviations').then(function(r) { return r.json(); }),
+      fetch('/api/signals').then(function(r) { return r.json(); }),
+    ]);
+
+    document.getElementById('stat-slices').textContent = stat.slices;
+    document.getElementById('stat-cal').textContent = stat.sabr_params;
+    document.getElementById('stat-dev').textContent = stat.deviations;
+    document.getElementById('stat-sig').textContent = stat.signals;
+
+    var hdr = document.getElementById('header-status');
+    if (stat.running) {
+      hdr.textContent = '运行中';
+      hdr.className = 'badge badge-running';
+    } else {
+      hdr.textContent = '停止';
+      hdr.className = 'badge badge-stopped';
+    }
+
+    document.getElementById('header-time').textContent =
+      stat.last_update ? new Date(stat.last_update * 1000).toLocaleTimeString() : '--';
+
+    // 更新 BTC 价格（按币种找对应 forward，避免被 ETH 切片覆盖标签）
+    if (slices.slices && slices.slices.length > 0) {
+      var btcSlice = slices.slices.find(function(s) { return s.currency === 'BTC'; });
+      var fwd = btcSlice ? btcSlice.forward : slices.slices[0].forward;
+      if (fwd) document.getElementById('header-btc-price').textContent =
+        '$' + fwd.toLocaleString(undefined, {maximumFractionDigits: 0});
+    }
+
+    currentData = {slices: slices, devs: devs, signals: signals};
+    renderHeatmap();
+    renderSignals();
+
+  } catch(e) {
+    console.log('fetch error:', e);
+  }
+}
+
+setInterval(fetchData, 3000);
+fetchData();
+
+// ---- 热力图 ----
+function renderHeatmap() {
+  var container = document.getElementById('heatmap-container');
+  if (!currentData || !currentData.slices || !currentData.slices.slices ||
+      currentData.slices.slices.length === 0) {
+    container.innerHTML = '<div style="text-align:center;padding:40px;color:#999;" class="loading">' + NO_DATA + '</div>';
+    return;
+  }
+
+  var slices = currentData.slices.slices;
+
+  // 按选中币种过滤
+  slices = slices.filter(function(s) { return s.currency === selectedCurr; });
+
+  var devs = currentData.devs.deviations || [];
+
+  // 取前 10 个到期日
+  var rows = slices.slice(0, 10);
+  if (rows.length === 0) {
+    container.innerHTML = '<div style="text-align:center;padding:40px;color:#999;" class="loading">' + NO_DATA + '</div>';
+    return;
+  }
+
+  // Delta 轴: 从 -0.25 (OTM put) 到 +0.25 (OTM call)
+  var deltaBuckets = [-0.25, -0.20, -0.15, -0.10, -0.05, 0.05, 0.10, 0.15, 0.20, 0.25];
+  var deltaLabels = ['-0.25','-0.20','-0.15','-0.10','-0.05','+0.05','+0.10','+0.15','+0.20','+0.25'];
+
+  // 构建偏差查找表（用 instrument_name 做 key，避免 floating point 问题）
+  var devMap = {};
+  devs.forEach(function(d) {
+    devMap[d.instrument] = d;
+  });
+
+  function cellColor(iv, mode) {
+    if (mode === 'abs') {
+      if (iv >= 0.65) return '#d32f2f';
+      if (iv >= 0.55) return '#e53935';
+      if (iv >= 0.45) return '#fb8c00';
+      if (iv >= 0.38) return '#fdd835';
+      if (iv >= 0.30) return '#66bb6a';
+      return '#42a5f5';
+    } else {
+      if (iv >= 4) return '#d32f2f';
+      if (iv >= 2) return '#e53935';
+      if (iv >= 0.5) return '#ffcdd2';
+      if (iv >= -0.5) return '#f5f5f5';
+      if (iv >= -2) return '#bbdefb';
+      return '#1e88e5';
+    }
+  }
+
+  function textColor(bg) {
+    var dark = ['#d32f2f','#e53935','#fb8c00','#1e88e5','#1565c0'];
+    return dark.indexOf(bg) >= 0 ? '#fff' : '#333';
+  }
+
+  var html = '<table class="heatmap-table"><thead><tr><th>DTE</th>';
+  deltaLabels.forEach(function(l) { html += '<th>' + l + '</th>'; });
+  html += '<th style="font-size:9px;color:#999;">偏斜</th></tr></thead><tbody>';
+
+  rows.forEach(function(r) {
+    html += '<tr><td style="font-weight:500;color:#666;text-align:right;padding-right:6px;font-size:10px;">' + r.dte + 'd</td>';
+
+    // 从 calls 和 puts 中按 delta 找最近的合约
+    var allContracts = (r.calls || []).map(function(c) { c.absDelta = Math.abs(c.delta || 0); return c; })
+      .concat((r.puts || []).map(function(p) { p.absDelta = Math.abs(p.delta || 0); return p; }));
+
+    function findNearest(targetDelta) {
+      var best = null;
+      var bestDiff = 999;
+      allContracts.forEach(function(x) {
+        var diff = Math.abs(x.delta - targetDelta);
+        if (diff < bestDiff) { bestDiff = diff; best = x; }
+      });
+      return best;
+    }
+
+    var rowVals = [];
+    deltaBuckets.forEach(function(db) {
+      var contract = findNearest(db);
+      if (!contract) { html += '<td style="background:#f5f5f5;">--</td>'; rowVals.push(null); return; }
+
+      // 用合约名查偏差（跳过浮动精度）
+      var dv = devMap[contract.instrument];
+      var iv = contract.iv;
+      var color, val, tc, cls = '';
+      if (viewMode === 'abs') {
+        color = cellColor(iv, 'abs');
+        val = (iv * 100).toFixed(0);
+        tc = textColor(color);
+      } else if (dv) {
+        color = cellColor(dv.deviation_pt, 'dev');
+        val = (dv.deviation_pt > 0 ? '+' : '') + dv.deviation_pt.toFixed(1);
+        tc = textColor(color);
+        if (Math.abs(dv.z_score) >= 1.5) cls = dv.z_score > 0 ? 'anomaly' : 'anomaly-neg';
+      } else {
+        // 无偏差数据，查 call/put 的同级合约
+        color = cellColor(iv, 'abs');
+        val = (iv * 100).toFixed(0);
+        tc = textColor(color);
+      }
+      rowVals.push(iv);
+      html += '<td class="' + cls + '" style="background:' + color + ';color:' + tc + ';"';
+      html += ' onclick="showDetail(' + r.dte + ',' + (contract ? contract.strike : 0) + ')">' + val + '</td>';
+    });
+
+    // 偏斜指示: 右尾(OTM call) IV - 左尾(OTM put) IV
+    var skew = rowVals[9] && rowVals[0] ? ((rowVals[9] - rowVals[0]) * 100).toFixed(1) : '--';
+    var skewColor = skew !== '--' ? (skew > 2 ? '#d32f2f' : skew < -2 ? '#1e88e5' : '#999') : '#999';
+    html += '<td style="font-size:10px;font-weight:500;color:' + skewColor + ';text-align:center;">' + (skew !== '--' ? (skew > 0 ? '+' : '') + skew : '--') + '</td>';
+    html += '</tr>';
+  });
+
+  html += '</tbody></table>';
+  container.innerHTML = html;
+}
+
+function showDetail(dte, strike) {
+  var card = document.getElementById('detail-card');
+  card.style.display = 'block';
+
+  var devs = currentData.devs.deviations || [];
+  var dv = devs.find(function(d) { return d.dte === dte && Math.abs(d.strike - strike) < 0.01; });
+
+  document.getElementById('detail-inst').textContent = dte + 'd @ ' + strike;
+
+  var grid = document.getElementById('detail-grid');
+  if (dv) {
+    grid.innerHTML =
+      '<div class="detail-item"><div class="label">市场 IV</div><div class="value">' + (dv.market_iv * 100).toFixed(1) + '%</div></div>' +
+      '<div class="detail-item"><div class="label">SABR 期望 IV</div><div class="value">' + (dv.expected_iv * 100).toFixed(1) + '%</div></div>' +
+      '<div class="detail-item"><div class="label">偏差</div><div class="value" style="color:' + (dv.deviation_pt > 0 ? '#d32f2f' : '#1e88e5') + '">' + (dv.deviation_pt > 0 ? '+' : '') + dv.deviation_pt.toFixed(1) + 'pt</div></div>' +
+      '<div class="detail-item"><div class="label">Z-score</div><div class="value">' + dv.z_score.toFixed(1) + '</div></div>' +
+      '<div class="detail-item"><div class="label">Delta</div><div class="value">' + dv.delta.toFixed(3) + '</div></div>';
+  } else {
+    grid.innerHTML = '<div style="color:#999;">该合约暂无偏差数据</div>';
+  }
+}
+
+function switchView(mode) {
+  viewMode = mode;
+  document.querySelectorAll('.heatmap-btn')[0].classList.toggle('active', mode === 'abs');
+  document.querySelectorAll('.heatmap-btn')[1].classList.toggle('active', mode === 'dev');
+  document.getElementById('view-indicator').textContent = mode === 'abs' ? '红色=高IV' : '红色=偏高, 蓝色=偏低';
+  renderHeatmap();
+}
+
+function switchCurr(curr) {
+  selectedCurr = curr;
+  document.getElementById('curr-btc').classList.toggle('active', curr === 'BTC');
+  document.getElementById('curr-eth').classList.toggle('active', curr === 'ETH');
+  renderHeatmap();
+}
+
+// ---- 信号列表 ----
+function renderSignals() {
+  var list = document.getElementById('signal-list');
+  var allSigs = currentData && currentData.signals ? currentData.signals.signals || [] : [];
+  // 按选中的币种过滤
+  var sigs = allSigs.filter(function(s) { return (s.currency || '').toUpperCase() === selectedCurr; });
+
+  document.getElementById('signal-count').textContent = '(' + sigs.length + '/' + allSigs.length + ')';
+
+  if (sigs.length === 0) {
+    list.innerHTML = '<div style="text-align:center;padding:20px;color:#999;">暂无信号</div>';
+    return;
+  }
+
+  var html = '';
+  sigs.forEach(function(s) {
+    var confColor = s.confidence === 'high' ? '#2e7d32' : (s.confidence === 'medium' ? '#f57f17' : '#999');
+    html += '<div class="signal-card">';
+    html += '  <div class="title">' + (s.direction === 'short' ? '做空' : '做多') + ' ' + s.strategy_type + '</div>';
+    html += '  <div class="sub">' + s.description + '</div>';
+    html += '  <div class="sub" style="color:' + confColor + ';">置信度: ' + s.confidence + '</div>';
+    if (typeof s.estimated_delta !== 'undefined') {
+      var premStr = (s.expected_premium >= 0 ? '+' : '') + (s.expected_premium || 0).toFixed(5) + ' ' + (s.currency || '');
+      var deltaStr = (s.estimated_delta >= 0 ? '+' : '') + (s.estimated_delta || 0).toFixed(3);
+      var hedgeStr = (s.hedge_amount > 0 ? (s.hedge_direction === 'long' ? '买' : '卖') + ' ' + s.hedge_amount.toFixed(4) + ' ' + (s.currency || '') + '-PERP' : '—');
+      html += '  <div class="sub">预估权利金: <b>' + premStr + '</b> | 净Δ: <b>' + deltaStr + '</b></div>';
+      html += '  <div class="sub">对冲腿: ' + hedgeStr + '</div>';
+    }
+    html += '  <div class="actions">';
+    html += '    <button class="btn-execute" onclick="executeSignal(\'' + s.id + '\')">执行</button>';
+    html += '    <button onclick="ignoreSignal(\'' + s.id + '\')">忽略</button>';
+    html += '  </div>';
+    html += '</div>';
+  });
+  list.innerHTML = html;
+}
+
+async function executeSignal(id) {
+  if (!confirm('确认执行此策略？')) return;
+  try {
+    // 先标记确认（后端校验必须有 confirmed 状态）
+    await fetch('/api/signal/' + id + '/confirm', {method: 'POST'});
+    var r = await fetch('/api/execute', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({signal_id: id})
+    });
+    var data = await r.json();
+    alert(data.status === 'ok' ? '执行成功' : '执行失败: ' + data.message);
+    if (data.status === 'ok') {
+      setTimeout(refreshPositions, 500);
+      document.getElementById('positions-card').scrollIntoView({behavior:'smooth'});
+    }
+  } catch(e) {
+    alert('请求失败');
+  }
+}
+
+async function ignoreSignal(id) {
+  await fetch('/api/signal/' + id + '/ignore', {method: 'POST'});
+  renderSignals();
+}
+
+async function setCredentials() {
+  var id = document.getElementById('cred-id').value;
+  var secret = document.getElementById('cred-secret').value;
+  if (!id || !secret) { alert('请填写 Client ID 和 Secret'); return; }
+  try {
+    var r = await fetch('/api/credentials', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({client_id: id, client_secret: secret})
+    });
+    var data = await r.json();
+    document.getElementById('cred-status').textContent = data.status === 'ok' ? '已保存，交易接口连接成功' : '保存失败: ' + data.message;
+  } catch(e) {
+    document.getElementById('cred-status').textContent = '连接失败: ' + e;
+  }
+}
+
+// ---- 策略持仓管理 ----
+async function refreshPositions() {
+  try {
+    var r = await fetch('/api/positions');
+    var data = await r.json();
+    var body = document.getElementById('positions-body');
+    var positions = data.positions || [];
+    var summary = data.summary || {};
+
+    document.getElementById('pos-count').textContent = '(' + positions.length + ')';
+
+    if (positions.length === 0) {
+      body.innerHTML = '<div style="text-align:center;padding:20px;color:#999;">暂无持仓 — 在信号列表中点击"执行"后自动添加</div>';
+      return;
+    }
+
+    var html = '';
+
+    // 汇总行
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin-bottom:12px;padding:10px;background:#f8f9fa;border-radius:8px;">';
+    html += '  <div><div style="font-size:10px;color:#999;">持仓数</div><div style="font-size:16px;font-weight:600;">' + summary.count + '</div></div>';
+    html += '  <div><div style="font-size:10px;color:#999;">Net Delta</div><div style="font-size:16px;font-weight:600;color:' + (summary.delta > 0.01 ? '#d32f2f' : summary.delta < -0.01 ? '#1e88e5' : '#333') + ';">' + summary.delta.toFixed(3) + '</div></div>';
+    html += '  <div><div style="font-size:10px;color:#999;">Net Gamma</div><div style="font-size:16px;font-weight:600;">' + summary.gamma.toFixed(4) + '</div></div>';
+    html += '  <div><div style="font-size:10px;color:#999;">Net Vega</div><div style="font-size:16px;font-weight:600;">' + (summary.vega * 100).toFixed(0) + '</div></div>';
+    html += '  <div><div style="font-size:10px;color:#999;">Net Theta</div><div style="font-size:16px;font-weight:600;">' + (summary.theta * 100).toFixed(0) + '/d</div></div>';
+    html += '  <div><div style="font-size:10px;color:#999;">Bartlett Delta</div><div style="font-size:16px;font-weight:600;color:' + (summary.bartlett > 0.01 ? '#d32f2f' : summary.bartlett < -0.01 ? '#1e88e5' : '#333') + ';">' + summary.bartlett.toFixed(3) + '</div></div>';
+    html += '</div>';
+
+    // Delta 对冲指示
+    var needHedge = Math.abs(summary.bartlett) > 0.5;
+    if (needHedge) {
+      html += '<div style="padding:8px 12px;background:#fff3e0;border-radius:6px;margin-bottom:10px;font-size:12px;display:flex;align-items:center;gap:8px;">';
+      html += '  <span>Delta 偏离 ' + summary.bartlett.toFixed(3) + ' — 建议对冲 ' + (-summary.bartlett).toFixed(3) + ' ' + 'BTC-PERPETUAL</span>';
+      html += '</div>';
+    }
+
+    // 逐笔持仓
+    positions.forEach(function(p) {
+      var dt = new Date(p.executed_at * 1000).toLocaleString();
+      html += '<div class="signal-card">';
+      html += '  <div class="title">' + (p.direction === 'short' ? '做空' : '做多') + ' ' + p.strategy_type + ' | ' + p.currency + '</div>';
+      html += '  <div class="sub">' + p.description + '</div>';
+      html += '  <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(80px,1fr));gap:4px;margin:6px 0;font-size:11px;">';
+      html += '    <div><span style="color:#999;">Delta</span><br><span style="font-weight:500;color:' + (p.net_delta > 0 ? '#d32f2f' : p.net_delta < 0 ? '#1e88e5' : '#333') + ';">' + p.net_delta.toFixed(3) + '</span></div>';
+      html += '    <div><span style="color:#999;">Gamma</span><br><span style="font-weight:500;">' + p.net_gamma.toFixed(4) + '</span></div>';
+      html += '    <div><span style="color:#999;">Vega</span><br><span style="font-weight:500;">' + (p.net_vega * 100).toFixed(0) + '</span></div>';
+      html += '    <div><span style="color:#999;">Theta</span><br><span style="font-weight:500;">' + (p.net_theta * 100).toFixed(0) + '/d</span></div>';
+      html += '    <div><span style="color:#999;">Bartlett Delta</span><br><span style="font-weight:500;">' + p.bartlett_delta.toFixed(3) + '</span></div>';
+      html += '    <div><span style="color:#999;">对冲</span><br><span style="font-weight:500;">' + (p.hedge_active ? '格致' : '手动') + '</span></div>';
+      html += '  </div>';
+      html += '  <div class="sub" style="font-size:10px;color:#bbb;">' + dt + ' | ID: ' + p.signal_id.slice(0,8) + '</div>';
+      html += '  <div class="actions" style="margin-top:6px;">';
+      html += '    <button onclick="closePosition(\'' + p.signal_id + '\')" style="padding:4px 10px;border-radius:4px;border:1px solid #e53935;color:#e53935;font-size:11px;cursor:pointer;background:#fff;">平仓</button>';
+      html += '  </div>';
+      html += '</div>';
+    });
+
+    body.innerHTML = html;
+  } catch(e) {
+    console.log('positions error:', e);
+  }
+}
+
+async function closePosition(id) {
+  if (!confirm('确认平仓？')) return;
+  await fetch('/api/position/' + id + '/close', {method:'POST'});
+  refreshPositions();
+}
+
+// ---- 格致对冲 ----
+async function glLogin() {
+  var email = document.getElementById('gl-email').value;
+  var pwd = document.getElementById('gl-pwd').value;
+  if (!email || !pwd) { alert('请填写格致邮箱和密码'); return; }
+  try {
+    var r = await fetch('/api/gl-hedge/login', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({email:email, pwd:pwd})
+    });
+    var d = await r.json();
+    document.getElementById('gl-status').textContent = d.status === 'ok' ? '已登录 账户: ' + d.account_id : '登录失败: ' + d.message;
+  } catch(e) { document.getElementById('gl-status').textContent = '请求失败'; }
+}
+
+async function glStart() {
+  var cur = document.getElementById('gl-currency').value;
+  try {
+    var r = await fetch('/api/gl-hedge/start?currency=' + cur, {method:'POST'});
+    var d = await r.json();
+    document.getElementById('gl-status').textContent = d.status === 'ok' ? '对冲已启动: ' + cur : '启动失败: ' + d.message;
+    if (d.status === 'ok') setTimeout(refreshPositions, 1000);
+  } catch(e) { document.getElementById('gl-status').textContent = '请求失败'; }
+}
+
+async function glStop() {
+  try {
+    var r = await fetch('/api/gl-hedge/stop', {method:'POST'});
+    var d = await r.json();
+    document.getElementById('gl-status').textContent = d.status === 'ok' ? '对冲已停止' : '停止失败: ' + d.message;
+    setTimeout(refreshPositions, 500);
+  } catch(e) { document.getElementById('gl-status').textContent = '请求失败'; }
+}
+
+async function glStatus() {
+  try {
+    var cur = document.getElementById('gl-currency').value;
+    var r = await fetch('/api/gl-hedge/status?currency=' + cur);
+    var d = await r.json();
+    document.getElementById('gl-status').textContent = d.status === 'ok'
+      ? '运行中: ' + (d.is_run ? '是' : '否')
+      : '状态查询: ' + (d.message || '无');
+  } catch(e) { document.getElementById('gl-status').textContent = '请求失败'; }
+}
+
+// 定时期权持仓
+setInterval(refreshPositions, 5000);
+</script>
+
+</body>
+</html>

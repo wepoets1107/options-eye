@@ -1,0 +1,55 @@
+# 期权天眼 配置模板（config.example.yaml）
+# 复制为 config.yaml 后按需修改。本文件不含任何密钥，可安全提交。
+
+# Deribit 连接
+deribit:
+  testnet: false                 # 交易用测试网（不影响公共数据）
+  public_ws: "wss://www.deribit.com/ws/api/v2"  # 数据走主网（有真实期权链）
+  trade_ws: "wss://test.deribit.com/ws/api/v2"  # 交易走测试网
+  # ticker 推送间隔：仅 100ms 与 raw（需认证）在公共连接上实际推送；
+  # 1s / 5s / 1m 在公共 API 上实测不推送，请勿使用。
+  ticker_interval: "100ms"
+
+# 策略范围过滤（全部可调）
+filters:
+  min_dte: 7                     # 最小到期日
+  max_dte: 365                   # 最大到期日
+  delta_min: 0.05                # Delta 下限
+  delta_max: 0.25                # Delta 上限
+  min_oi: 10                     # 最小 OI（张数）
+  min_volume_24h: 0              # 最小 24h 成交量
+  z_score_threshold: 2.0         # Z-score 偏差阈值
+
+# SABR 校准
+sabr:
+  beta: 0.7                      # 固定 β
+  alpha_min: 0.01
+  alpha_max: 30.0
+  rho_min: -0.8
+  rho_max: 0.5
+  nu_min: 0.05
+  nu_max: 2.0
+  calibrate_interval_sec: 30
+  min_strikes_per_expiry: 5
+  max_data_age_minutes: 5
+  max_price_change_pct: 5.0
+  extreme_vol_window_days: 7
+
+# 扫描频率
+scan:
+  chain_snapshot_interval_sec: 5
+  signal_interval_sec: 30
+  price_smooth_minutes: 5
+  instrument_refresh_sec: 300    # 合约列表刷新+重建 ticker 订阅周期
+
+# Web 服务
+web:
+  host: "127.0.0.1"
+  port: 5051
+
+# 日志
+logging:
+  level: "INFO"
+  file: "logs/options-eye.log"
+  max_size_mb: 10
+  backup_count: 3
