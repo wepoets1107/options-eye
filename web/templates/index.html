@@ -355,14 +355,25 @@ function renderHeatmap() {
   var devMap = {};
   devs.forEach(function(d) { devMap[d.instrument] = d; });
 
+  // 按币种动态计算 IV 范围（ABS 模式用，避免 BTC/ETH 不同基线导致误色）
+  var minIv = Infinity, maxIv = -Infinity;
+  if (viewMode === 'abs') {
+    rows.forEach(function(r) {
+      (r.calls || []).concat(r.puts || []).forEach(function(c) {
+        if (c.iv > 0) { if (c.iv < minIv) minIv = c.iv; if (c.iv > maxIv) maxIv = c.iv; }
+      });
+    });
+    if (minIv === Infinity) { minIv = 0.3; maxIv = 0.7; }
+    if (maxIv - minIv < 0.01) { minIv -= 0.05; maxIv += 0.05; }
+  }
+
   function cellColor(iv, mode) {
     if (mode === 'abs') {
-      if (iv >= 0.65) return '#c62828';
-      if (iv >= 0.55) return '#e53935';
-      if (iv >= 0.45) return '#fb8c00';
-      if (iv >= 0.38) return '#fdd835';
-      if (iv >= 0.30) return '#66bb6a';
-      return '#42a5f5';
+      // 按币种 IV 范围相对归一化：低→蓝(240°)，高→红(0°)，HSL 插值
+      var t = (iv - minIv) / (maxIv - minIv);
+      t = Math.max(0, Math.min(1, t));
+      var h = 240 - t * 210;
+      return 'hsl(' + Math.round(h) + ',75%,50%)';
     } else {
       if (iv >= 4) return '#c62828';
       if (iv >= 2) return '#e53935';
@@ -373,6 +384,8 @@ function renderHeatmap() {
     }
   }
   function textColor(bg) {
+    // HSL 颜色统一用白色（75% 饱和度 + 50% 明度下白色可读）
+    if (bg.indexOf('hsl') === 0) return '#fff';
     var dark = ['#c62828','#e53935','#fb8c00','#1565c0','#1a3a6b'];
     return dark.indexOf(bg) >= 0 ? '#fff' : '#333';
   }
@@ -430,16 +443,17 @@ function renderHeatmap() {
 
   html += '</tbody></table>';
   container.innerHTML = html;
-  renderLegend();
+  renderLegend(minIv, maxIv);
 }
 
-function renderLegend() {
+function renderLegend(minIv, maxIv) {
   var el = document.getElementById('heatmap-legend');
   if (viewMode === 'abs') {
     el.innerHTML =
-      '<div class="legend-item"><span class="legend-bar" style="background:linear-gradient(90deg,#42a5f5,#66bb6a,#fdd835,#fb8c00,#e53935,#c62828);"></span></div>' +
-      '<div class="legend-item" style="color:#65718a;">低 IV&nbsp;→&nbsp;高 IV</div>' +
+      '<div class="legend-item"><span class="legend-bar" style="background:linear-gradient(90deg,hsl(240,75%,50%),hsl(180,75%,50%),hsl(120,75%,50%),hsl(60,75%,50%),hsl(30,75%,50%),hsl(0,75%,50%));"></span></div>' +
+      '<div class="legend-item" style="color:#65718a;">' + selectedCurr + ' IV ' + (minIv !== undefined ? (minIv*100).toFixed(0) + '% → ' + (maxIv*100).toFixed(0) + '%' : '低→高') + '</div>' +
       '<div class="legend-item"><span class="legend-swatch" style="background:#fff;outline:2px solid #e53935;"></span> 偏高异常 (z≥1.5)</div>' +
+      '<div class="legend-item"><span class="legend-swatch" style="background:#fff;outline:2px solid #1e88e5;"></span> 偏低异常</div>';
       '<div class="legend-item"><span class="legend-swatch" style="background:#fff;outline:2px solid #1e88e5;"></span> 偏低异常</div>';
   } else {
     el.innerHTML =

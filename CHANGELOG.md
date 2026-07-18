@@ -3,6 +3,9 @@
 遵循语义化版本（见 `version.py`）。每次修改后递增版本号。
 Semantic versioning (see `version.py`). Bump the version after every change.
 
+## [0.8.1] - 2026-07-18
+- **修复热力图 IV 色阶 bug**：ABS 模式下颜色阈值硬编码（面向 BTC 的 30-45% IV 区间），导致 ETH（正常 IV 55-70%+）持续显示红色高估。改为按币种动态计算 IV 范围做相对色阶归一化（HSL 蓝→红渐变），图例同步显示币种名称与当前 IV 区间范围。
+
 ## [0.8.0] - 2026-07-18
 - **P0-1 修复持仓 PnL 符号反转**：`_finalize_signal` 与 `_update_position_greeks` 的权利金口径统一为净现金流（sell=+收 / buy=-付），`pnl=entry-current` 现在卖出策略盈利时正确显示正数。
 - **P0-2 修复信号 id 不稳定**：信号 id 改为基于内容哈希（currency+expiration+strategy_type+legs），主循环多轮重建信号 id 不变，确认/忽略状态不再丢失。
