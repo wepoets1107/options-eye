@@ -1,9 +1,9 @@
 """
 期权天眼 — 偏差检测 + 策略匹配引擎
 """
+import hashlib
 import logging
 import time
-import uuid
 import numpy as np
 from typing import Optional
 
@@ -14,6 +14,14 @@ from data.models import (
 from sabr.calibrator import sabr_iv, expected_iv
 
 logger = logging.getLogger(__name__)
+
+
+def _stable_signal_id(currency: str, expiration: int, strategy_type: str, legs: list[dict]) -> str:
+    """基于策略内容生成稳定 id（同一到期日+同类型+同腿组合 → 同 id），
+    保证主循环多轮重建信号时 id 不变，确认/忽略状态不丢失。"""
+    leg_key = "_".join(sorted(f"{l['instrument']}_{l['direction']}_{l.get('amount',1)}" for l in legs))
+    raw = f"{currency}_{expiration}_{strategy_type}_{leg_key}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
 
 
 def detect_deviations(
@@ -86,13 +94,17 @@ def detect_deviations(
     return deviations
 
 
-def _classify_deviation_pattern(expiry_deviations, log_mid_strike):
+def _classify_deviation_pattern(expiry_deviations, log_mid_strike, delta_min=0.05, delta_max=0.25):
     """分析单个到期日的偏差模式
 
     优先检曲率：两翼高+中间正常 → butterfly
     再检整体：所有合约同号偏高/偏低 → strangle
     再检偏斜：call/put 一侧高一侧低 → risk_reversal
-    """
+
+    wing/near 分档阈值跟随 delta_min/delta_max 动态计算（中点*0.6），
+    避免 delta_min 调大后 wing 样本过少。
+    z_score 可能被系统性偏差的 sigma 压缩，故 overpriced/underpriced
+    额外用绝对偏差均值（pt）做辅助判定。"""
     if not expiry_deviations:
         return {"pattern": "none", "confidence": "low", "z_avg": 0}
     calls = [d for d in expiry_deviations if d.kind == "call"]
@@ -100,12 +112,12 @@ def _classify_deviation_pattern(expiry_deviations, log_mid_strike):
     if not calls or not puts:
         return {"pattern": "none", "confidence": "low", "z_avg": 0}
 
-    # 按 Delta 分档：
-    # 深虚（翼）= Delta 0.05~0.15，浅虚（近翼/中间参考）= Delta 0.15~0.25
-    wing_calls = [c for c in calls if abs(c.delta) < 0.15]
-    wing_puts = [p for p in puts if abs(p.delta) < 0.15]
-    near_calls = [c for c in calls if abs(c.delta) >= 0.15]
-    near_puts = [p for p in puts if abs(p.delta) >= 0.15]
+    # wing 阈值动态化：默认 (0.05+0.25)/2*0.6=0.09，覆盖原硬编码 0.15 的常见场景
+    wing_thresh = max(0.05, (delta_min + delta_max) / 2 * 0.6)
+    wing_calls = [c for c in calls if abs(c.delta) < wing_thresh]
+    wing_puts = [p for p in puts if abs(p.delta) < wing_thresh]
+    near_calls = [c for c in calls if abs(c.delta) >= wing_thresh]
+    near_puts = [p for p in puts if abs(p.delta) >= wing_thresh]
 
     wing_call_z = float(np.mean([c.z_score for c in wing_calls])) if wing_calls else 0
     wing_put_z = float(np.mean([p.z_score for p in wing_puts])) if wing_puts else 0
@@ -113,23 +125,29 @@ def _classify_deviation_pattern(expiry_deviations, log_mid_strike):
     near_put_z = float(np.mean([p.z_score for p in near_puts])) if near_puts else 0
     avg_call_z = float(np.mean([c.z_score for c in calls]))
     avg_put_z = float(np.mean([p.z_score for p in puts]))
+    # 绝对偏差均值（pt），辅助判定系统性偏高/偏低（避免 sigma 压缩 z 导致漏检）
+    avg_call_pt = float(np.mean([c.deviation_pt for c in calls]))
+    avg_put_pt = float(np.mean([p.deviation_pt for p in puts]))
 
     high_conf = lambda z: abs(z) >= 2.0
 
-    # 1. 曲率检测：两翼高/低 + 近翼正常（wing 阈值放宽 1.0→0.8）
+    # 1. 曲率检测：两翼高/低 + 近翼正常（wing 阈值动态化）
     if wing_calls and wing_puts and (near_calls or near_puts):
         if wing_call_z > 0.8 and wing_put_z > 0.8 and abs(near_call_z) < 0.8 and abs(near_put_z) < 0.8:
             return {"pattern": "convex", "confidence": "high" if (high_conf(wing_call_z) and high_conf(wing_put_z)) else "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
         if wing_call_z < -0.8 and wing_put_z < -0.8 and abs(near_call_z) < 0.8 and abs(near_put_z) < 0.8:
             return {"pattern": "concave", "confidence": "high" if (high_conf(wing_call_z) and high_conf(wing_put_z)) else "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
 
-    # 2. 整体偏高/偏低：所有合约同号（阈值放宽 1.5→1.2）
-    if all(abs(z) >= 1.2 for z in [avg_call_z, avg_put_z]) and (avg_call_z > 0) == (avg_put_z > 0):
+    # 2. 整体偏高/偏低：z 同号（阈值 1.2），或绝对偏差均值同号且 >=2pt（防 sigma 压缩漏检）
+    z_ok = all(abs(z) >= 1.2 for z in [avg_call_z, avg_put_z]) and (avg_call_z > 0) == (avg_put_z > 0)
+    pt_ok = (avg_call_pt >= 2 and avg_put_pt >= 2 and (avg_call_pt > 0) == (avg_put_pt > 0)) or \
+            (avg_call_pt <= -2 and avg_put_pt <= -2 and (avg_call_pt > 0) == (avg_put_pt > 0))
+    if z_ok or pt_ok:
         z_avg = (avg_call_z + avg_put_z) / 2
-        if z_avg > 0:
-            return {"pattern": "overpriced", "confidence": "high" if high_conf(z_avg) else "medium", "z_avg": z_avg}
+        if z_avg > 0 or (avg_call_pt > 0 and avg_put_pt > 0):
+            return {"pattern": "overpriced", "confidence": "high" if (high_conf(z_avg) or avg_call_pt >= 4) else "medium", "z_avg": z_avg}
         else:
-            return {"pattern": "underpriced", "confidence": "high" if high_conf(z_avg) else "medium", "z_avg": z_avg}
+            return {"pattern": "underpriced", "confidence": "high" if (high_conf(z_avg) or avg_call_pt <= -4) else "medium", "z_avg": z_avg}
 
     # 3. 偏斜检测：一侧显著高于另一侧（阈值 1.5→1.2，差值 1.5→1.0）
     if avg_put_z > 1.2 and avg_call_z < avg_put_z - 1.0:
@@ -137,7 +155,7 @@ def _classify_deviation_pattern(expiry_deviations, log_mid_strike):
     if avg_call_z > 1.2 and avg_put_z < avg_call_z - 1.0:
         return {"pattern": "skew_call_rich", "confidence": "high" if high_conf(avg_call_z) else "medium", "z_avg": avg_call_z}
 
-    # 4. 兜底曲率（近翼数据不够时，阈值同步放宽 1.0→0.8）
+    # 4. 兜底曲率（近翼数据不够时，阈值同步动态化）
     if wing_calls and wing_puts:
         if wing_call_z > 0.8 and wing_put_z > 0.8:
             return {"pattern": "convex", "confidence": "medium", "z_avg": (wing_call_z + wing_put_z) / 2}
@@ -148,7 +166,10 @@ def _classify_deviation_pattern(expiry_deviations, log_mid_strike):
 
 
 def _finalize_signal(signal, slice_):
-    """用真实 Greeks 计算净 delta、对冲量、预估权利金（覆盖临时字段）"""
+    """用真实 Greeks 计算净 delta、对冲量、预估权利金（覆盖临时字段）
+
+    权利金口径 = 净现金流（卖出收权利金为正、买入付权利金为负），
+    与 Position.entry_premium / current_premium 一致；pnl = entry - current。"""
     cmap = {c.instrument: c for c in (slice_.calls + slice_.puts)}
     net_delta = 0.0
     prem = 0.0
@@ -156,7 +177,7 @@ def _finalize_signal(signal, slice_):
         c = cmap.get(l["instrument"])
         if not c:
             continue
-        sign = 1 if l["direction"] == "buy" else -1
+        sign = 1 if l["direction"] == "sell" else -1   # 现金流口径：卖=+收/买=-付
         net_delta += sign * c.delta
         prem += sign * (c.mark_price or 0) * l["amount"]
     signal.estimated_delta = round(net_delta, 4)
@@ -165,7 +186,7 @@ def _finalize_signal(signal, slice_):
     signal.expected_premium = round(prem, 6)
 
 
-def generate_signals(deviations, slices, sabr_params, z_threshold=2.0):
+def generate_signals(deviations, slices, sabr_params, z_threshold=2.0, delta_min=0.05, delta_max=0.25):
     if not deviations:
         return []
     signals = []
@@ -182,7 +203,7 @@ def generate_signals(deviations, slices, sabr_params, z_threshold=2.0):
         if not slice_:
             continue
         log_mid = slice_.forward
-        pattern = _classify_deviation_pattern(devs, log_mid)
+        pattern = _classify_deviation_pattern(devs, log_mid, delta_min=delta_min, delta_max=delta_max)
         if pattern["pattern"] == "none" or pattern["confidence"] == "low":
             continue
         # 配对用全部偏差（spread 仅作评级，不硬过滤）；
@@ -196,6 +217,8 @@ def generate_signals(deviations, slices, sabr_params, z_threshold=2.0):
         if signal and (pattern["confidence"] == "high" or
                        (pattern["confidence"] == "medium" and abs(pattern["z_avg"]) >= 1.2)):
             _finalize_signal(signal, slice_)
+            # 用稳定 id 覆盖 uuid，保证多轮重建信号时确认/忽略状态不丢失
+            signal.id = _stable_signal_id(signal.currency, slice_.expiration, signal.strategy_type, signal.legs)
             signals.append(signal)
     return signals
 
@@ -283,7 +306,8 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         ]
 
         return Signal(
-            id=uuid.uuid4().hex[:12], currency=currency,
+            id="",  # 由 generate_signals 用稳定 id 覆盖
+            currency=currency,
             strategy_type=strat_type, direction=direction,
             confidence=pattern["confidence"],
             description="".join(desc_parts),
@@ -292,8 +316,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
                 {"instrument": partner.instrument, "direction": part_act, "amount": 1},
             ],
             hedge_instrument=f"{currency}-PERPETUAL",
-            hedge_direction="long" if call_leg.delta > 0.5 else "short",
-            hedge_amount=abs(call_leg.delta + put_leg.delta - 1),
+            hedge_direction="", hedge_amount=0,   # 由 _finalize_signal 用真实 Greeks 计算
             expected_premium=0, estimated_delta=0,
             deviations=devs, created_at=now
         )
@@ -310,7 +333,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not buy_leg:
             return None
         return Signal(
-            id=uuid.uuid4().hex[:12], currency=currency,
+            id="", currency=currency,
             strategy_type="risk_reversal", direction="short",
             confidence=pattern["confidence"],
             description=(
@@ -340,7 +363,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not buy_leg:
             return None
         return Signal(
-            id=uuid.uuid4().hex[:12], currency=currency,
+            id="", currency=currency,
             strategy_type="risk_reversal", direction="long",
             confidence=pattern["confidence"],
             description=(
@@ -390,7 +413,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         body_act = "buy" if dir_ == "short" else "sell"
 
         return Signal(
-            id=uuid.uuid4().hex[:12], currency=currency,
+            id="", currency=currency,
             strategy_type="butterfly", direction=dir_,
             confidence=pattern["confidence"],
             description=(

@@ -121,6 +121,10 @@ async def main_loop(
                 last_instr_refresh = now
 
             # 1. 构建期权链快照（直接读 ticker 推送缓存）
+            #    运行时参数（前端滑块）优先，覆盖 config 默认
+            rp = web_state.get("runtime_params", {})
+            rp_dte = rp.get("min_dte", filters.get("min_dte", 7))
+            rp_oi = rp.get("min_oi", filters.get("min_oi", 10))
             max_age = sabr_cfg.get("max_data_age_minutes", 5) * 60
             raw = ws.get_all_ticker(max_age)
 
@@ -128,18 +132,18 @@ async def main_loop(
             btc_price = ws.index_price.get("btc_usdc") or await ws.get_index_price("btc_usdc")
             btc_slices = build_chain_snapshot(
                 raw, btc_price or 0, "BTC",
-                min_dte=filters.get("min_dte", 7),
+                min_dte=rp_dte,
                 max_dte=filters.get("max_dte", 365),
-                min_oi=filters.get("min_oi", 10)
+                min_oi=rp_oi
             )
 
             # ETH
             eth_price = ws.index_price.get("eth_usdc") or await ws.get_index_price("eth_usdc")
             eth_slices = build_chain_snapshot(
                 raw, eth_price or 0, "ETH",
-                min_dte=filters.get("min_dte", 7),
+                min_dte=rp_dte,
                 max_dte=filters.get("max_dte", 365),
-                min_oi=filters.get("min_oi", 10)
+                min_oi=rp_oi
             )
 
             all_slices = btc_slices + eth_slices
@@ -166,11 +170,11 @@ async def main_loop(
             else:
                 sabr_params = web_state.get("latest_sabr_params", {})
 
-            # 4. 偏差检测
-            z_threshold = filters.get("z_score_threshold", 2.0)
-            delta_min = filters.get("delta_min", 0.05)
-            delta_max = filters.get("delta_max", 0.25)
-            min_oi = filters.get("min_oi", 10)
+            # 4. 偏差检测（运行时参数 rp 已在 #1 读取）
+            z_threshold = rp.get("z_threshold", filters.get("z_score_threshold", 2.0))
+            delta_min = rp.get("delta_min", filters.get("delta_min", 0.05))
+            delta_max = rp.get("delta_max", filters.get("delta_max", 0.25))
+            min_oi = rp_oi
 
             deviations = detect_deviations(
                 all_slices, sabr_params,
@@ -180,8 +184,11 @@ async def main_loop(
                 min_oi=min_oi
             )
 
-            # 5. 信号生成
-            signals = generate_signals(deviations, all_slices, sabr_params, z_threshold=z_threshold)
+            # 5. 信号生成（传 delta 参数供 _classify 动态分档）
+            signals = generate_signals(
+                deviations, all_slices, sabr_params,
+                z_threshold=z_threshold, delta_min=delta_min, delta_max=delta_max
+            )
 
             # 6. 更新 Geeks 持仓
             pm = web_state.get("position_manager")

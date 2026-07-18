@@ -358,13 +358,10 @@ class DeribitWS:
                 continue
             silent = time.time() - self.last_ticker_ts
             if silent > 60:
-                logger.warning(f"看门狗: ticker 静默 {int(silent)}s，重订阅")
-                try:
-                    await self.manage_ticker_subscriptions(self.instruments)
-                except Exception as e:
-                    logger.error(f"看门狗重订阅失败: {e}")
-            if silent > 120:
-                logger.warning("看门狗: ticker 静默>120s，强制重连所有 ticker 连接")
+                # 60s 静默：直接 close 各 ticker 连接的 ws，触发 _ticker_recv_loop
+                # 异常 → _ticker_connect 重连（比 diff 重订阅有效：subscribed 集合
+                # 不变时 manage_ticker_subscriptions 是空操作，无法自愈）
+                logger.warning(f"看门狗: ticker 静默 {int(silent)}s，强制重连所有 ticker 连接")
                 for conn in self.ticker_conns:
                     conn.running = False
                     try:

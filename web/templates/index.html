@@ -157,8 +157,8 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Ping
       <div class="card-header">
         IV 曲面热力图
         <div class="heatmap-controls">
-          <button class="heatmap-btn active" onclick="switchView('abs')">IV 绝对值</button>
-          <button class="heatmap-btn" onclick="switchView('dev')">SABR 偏差</button>
+          <button class="heatmap-btn active" onclick="switchView('abs')" id="view-abs">IV 绝对值</button>
+          <button class="heatmap-btn" onclick="switchView('dev')" id="view-dev">SABR 偏差</button>
           <span style="width:1px;height:18px;background:#d4dbe6;margin:0 4px;"></span>
           <button class="heatmap-btn active" onclick="switchCurr('BTC')" id="curr-btc">BTC</button>
           <button class="heatmap-btn" onclick="switchCurr('ETH')" id="curr-eth">ETH</button>
@@ -233,19 +233,57 @@ let selectedCurr = 'BTC';
 let currentData = null;
 const NO_DATA = '等待数据...';
 
-// ---- 参数同步 ----
+// ---- 参数同步（滑块变化即时下发后端，主循环下一轮生效）----
+function readSliderVal(k) {
+  var el = document.getElementById('param-' + k);
+  if (!el) return null;
+  if (k === 'dmin' || k === 'dmax') return parseInt(el.value) / 100;
+  if (k === 'z') return parseInt(el.value) / 10;
+  return parseFloat(el.value);
+}
 ['dte','dmin','dmax','z','oi'].forEach(function(k) {
   var el = document.getElementById('param-' + k);
   var vl = document.getElementById('param-' + k + '-val');
   if (el && vl) {
     el.addEventListener('input', function() {
-      if (k === 'dmin') vl.textContent = (parseInt(el.value)/100).toFixed(2);
-      else if (k === 'dmax') vl.textContent = (parseInt(el.value)/100).toFixed(2);
-      else if (k === 'z') vl.textContent = (parseInt(el.value)/10).toFixed(1);
-      else vl.textContent = el.value;
+      var v = readSliderVal(k);
+      vl.textContent = (k==='dmin'||k==='dmax') ? v.toFixed(2) : (k==='z' ? v.toFixed(1) : v);
     });
+    // change 时下发后端（避免拖动过程中频繁请求）
+    el.addEventListener('change', syncParams);
   }
 });
+
+async function syncParams() {
+  var body = {
+    min_dte: readSliderVal('dte'),
+    delta_min: readSliderVal('dmin'),
+    delta_max: readSliderVal('dmax'),
+    z_threshold: readSliderVal('z'),
+    min_oi: readSliderVal('oi')
+  };
+  try {
+    await fetch('/api/params', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+  } catch(e) { console.log('syncParams error:', e); }
+}
+
+// 页面加载时从后端回填滑块值（保持刷新后一致）
+async function loadParams() {
+  try {
+    var r = await fetch('/api/params');
+    var d = await r.json();
+    var p = d.runtime_params || {};
+    if (p.min_dte != null) { document.getElementById('param-dte').value = p.min_dte; document.getElementById('param-dte-val').textContent = p.min_dte; }
+    if (p.delta_min != null) { document.getElementById('param-dmin').value = p.delta_min*100; document.getElementById('param-dmin-val').textContent = p.delta_min.toFixed(2); }
+    if (p.delta_max != null) { document.getElementById('param-dmax').value = p.delta_max*100; document.getElementById('param-dmax-val').textContent = p.delta_max.toFixed(2); }
+    if (p.z_threshold != null) { document.getElementById('param-z').value = p.z_threshold*10; document.getElementById('param-z-val').textContent = p.z_threshold.toFixed(1); }
+    if (p.min_oi != null) { document.getElementById('param-oi').value = p.min_oi; document.getElementById('param-oi-val').textContent = p.min_oi; }
+  } catch(e) { console.log('loadParams error:', e); }
+}
+loadParams();
 
 // ---- 数据轮询 ----
 async function fetchData() {
@@ -435,8 +473,8 @@ function showDetail(dte, strike) {
 
 function switchView(mode) {
   viewMode = mode;
-  document.querySelectorAll('.heatmap-btn')[0].classList.toggle('active', mode === 'abs');
-  document.querySelectorAll('.heatmap-btn')[1].classList.toggle('active', mode === 'dev');
+  document.getElementById('view-abs').classList.toggle('active', mode === 'abs');
+  document.getElementById('view-dev').classList.toggle('active', mode === 'dev');
   renderHeatmap();
 }
 function switchCurr(curr) {
@@ -491,12 +529,23 @@ async function executeSignal(id) {
       body: JSON.stringify({signal_id: id})
     });
     var data = await r.json();
-    alert(data.status === 'ok' ? '执行成功' : '执行失败: ' + data.message);
-    if (data.status === 'ok') {
-      setTimeout(refreshPositions, 500);
-      document.getElementById('positions-card').scrollIntoView({behavior:'smooth'});
+    if (data.status !== 'ok') { alert('执行失败: ' + (data.message || '未知错误')); return; }
+    // 解析每腿状态，检测部分成交/对冲跳过
+    var results = data.results || {};
+    var legs = Object.keys(results);
+    var errors = legs.filter(function(k){ return results[k] && (results[k].status === 'error' || results[k].status === 'hedge_error'); });
+    var skipped = legs.filter(function(k){ return results[k] && results[k].status === 'hedge_skipped'; });
+    var okLegs = legs.filter(function(k){ return results[k] && (results[k].status === 'ok' || results[k].status === 'hedge_ok'); });
+    var msg = '执行完成：成功 ' + okLegs.length + ' 腿';
+    if (errors.length > 0) msg += '，失败 ' + errors.length + ' 腿（' + errors.join(', ') + '）';
+    if (skipped.length > 0) msg += '，对冲跳过（' + (results[skipped[0]].reason || '量太小') + '）';
+    if (errors.length > 0) {
+      msg += '\n\n⚠️ 存在失败腿，可能有单腿敞口！请检查持仓并决定是否手动平掉已成交腿。';
     }
-  } catch(e) { alert('请求失败'); }
+    alert(msg);
+    setTimeout(refreshPositions, 500);
+    document.getElementById('positions-card').scrollIntoView({behavior:'smooth'});
+  } catch(e) { alert('请求失败: ' + e); }
 }
 
 async function ignoreSignal(id) {
@@ -615,10 +664,11 @@ async function glStart() {
 }
 
 async function glStop() {
+  var cur = document.getElementById('gl-currency').value;
   try {
-    var r = await fetch('/api/gl-hedge/stop', {method:'POST'});
+    var r = await fetch('/api/gl-hedge/stop?currency=' + cur, {method:'POST'});
     var d = await r.json();
-    document.getElementById('gl-status').textContent = d.status === 'ok' ? '对冲已停止' : '停止失败: ' + d.message;
+    document.getElementById('gl-status').textContent = d.status === 'ok' ? '对冲已停止: ' + cur : '停止失败: ' + d.message;
     document.getElementById('gl-params').style.display = 'none';
     setTimeout(refreshPositions, 500);
   } catch(e) { document.getElementById('gl-status').textContent = '请求失败'; }

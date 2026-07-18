@@ -119,7 +119,8 @@ def calibrate_expiry(
     """
     对单个到期日进行 SABR 校准
 
-    合并 call 和 put 的 IV 数据一起拟合
+    只用 OTM 合约（call: K>F, put: K<F）的 mark_iv 拟合，
+    ITM 合约 IV 不稳定且流动性差，会引入噪声。
     """
     f = slice_.forward
     if not f or f <= 0:
@@ -129,19 +130,21 @@ def calibrate_expiry(
     if t <= 0:
         return None
 
-    # 收集可用于校准的合约数据
+    # 收集可用于校准的合约数据（仅 OTM）
     strikes = []
     ivs = []
     kinds = []
 
     for c in slice_.calls:
-        if c.mark_iv > 0 and c.strike > 0:
+        # OTM call: 行权价 > 远期
+        if c.mark_iv > 0 and c.strike > 0 and c.strike > f:
             strikes.append(c.strike)
             ivs.append(c.mark_iv)
             kinds.append("call")
 
     for p in slice_.puts:
-        if p.mark_iv > 0 and p.strike > 0:
+        # OTM put: 行权价 < 远期
+        if p.mark_iv > 0 and p.strike > 0 and p.strike < f:
             strikes.append(p.strike)
             ivs.append(p.mark_iv)
             kinds.append("put")
@@ -180,8 +183,8 @@ def calibrate_expiry(
         alpha, rho, nu = result.x
         rmse = np.sqrt(np.mean(result.fun ** 2)) if len(result.fun) > 0 else 999
 
-        # 检查是否收敛
-        converged = result.success and rmse < 0.5
+        # 检查是否收敛（RMSE 阈值 0.05 = 5% IV，过松会引入噪声校准）
+        converged = result.success and rmse < 0.05
 
         if converged:
             logger.info(
@@ -228,19 +231,3 @@ def expected_iv(
 ) -> float:
     """用已校准的 SABR 参数计算某行权价的期望 IV"""
     return sabr_iv(f, k, t, sabr.alpha, sabr.beta, sabr.rho, sabr.nu)
-
-
-def compute_bartlett_delta(
-    contract: OptionContract,
-    slice_: ExpirySlice,
-    sabr: SabrParams
-) -> float:
-    """计算 Bartlett Delta"""
-    t = slice_.dte / 365.0
-    bs_delta = contract.delta
-    bs_vega = contract.vega
-    return _calc_bartlett_delta(
-        slice_.forward, contract.strike, t,
-        sabr.alpha, sabr.beta, sabr.rho, sabr.nu,
-        bs_delta, bs_vega
-    )

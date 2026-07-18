@@ -25,10 +25,10 @@ class Position:
         self.executed_at = int(time.time())
         self.status = "open"  # open / closed
 
-        # 入场权利金（净，币本位）。buy 为负、sell 为正。
+        # 入场权利金（净现金流，币本位）：sell=+收权利金 / buy=-付权利金
         self.entry_premium = float(getattr(signal, "expected_premium", 0.0) or 0.0)
         # 盈亏（由外部基于实时 mark_price 更新）
-        self.current_premium = 0.0      # 当前平仓所需净权利金（币本位）
+        self.current_premium = 0.0      # 当前平仓净现金流（币本位，同口径）
         self.pnl = 0.0                  # 未实现盈亏 = entry_premium - current_premium
         self.pnl_pct = 0.0              # 盈亏百分比
 
@@ -115,7 +115,7 @@ class PositionManager:
             inst = leg.get("instrument", "")
             direction = leg.get("direction", "buy")
             amount = leg.get("amount", 1)
-            side = 1 if direction == "buy" else -1
+            side = 1 if direction == "sell" else -1   # 现金流口径：与 entry 一致（sell=+收/buy=-付）
 
             try:
                 parts = inst.split("-")

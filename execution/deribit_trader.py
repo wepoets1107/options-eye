@@ -64,7 +64,7 @@ class DeribitTrader:
         async with self._lock:
             self._req_id += 1
             req_id = self._req_id
-            future = asyncio.get_event_loop().create_future()
+            future = asyncio.get_running_loop().create_future()
             self._pending[req_id] = future
             msg = {
                 "jsonrpc": "2.0",

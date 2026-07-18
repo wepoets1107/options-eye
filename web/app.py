@@ -35,6 +35,7 @@ state = {
     "position_manager": None,
     "gl_hedge": None,
     "signal_status_overrides": {},   # signal_id -> confirmed/ignored（主循环重建 latest_signals 时回填）
+    "runtime_params": {},            # 前端动态参数（min_dte/delta_min/delta_max/z_threshold/min_oi），覆盖 config 默认
     "version": "",                   # 由 main.py 注入（APP_VERSION）
 }
 
@@ -108,7 +109,7 @@ async def api_slices():
             for c in s.calls
         ]
         puts_data = [
-            {"strike": p.strike, "iv": p.mark_iv, "delta": abs(p.delta), "oi": p.open_interest,
+            {"strike": p.strike, "iv": p.mark_iv, "delta": p.delta, "oi": p.open_interest,
              "instrument": p.instrument, "bid": p.bid_price, "ask": p.ask_price}
             for p in s.puts
         ]
@@ -158,6 +159,11 @@ async def api_signals():
     """获取策略信号（合并确认/忽略状态，避免主循环重建后丢失）"""
     sigs = state["latest_signals"]
     overrides = state["signal_status_overrides"]
+    # 清理：只保留当前活跃信号 id 的 override，避免长期运行积累废弃 id
+    if sigs and len(overrides) > 50:
+        active_ids = {s["id"] for s in sigs}
+        state["signal_status_overrides"] = {k: v for k, v in overrides.items() if k in active_ids}
+        overrides = state["signal_status_overrides"]
     for s in sigs:
         ov = overrides.get(s["id"])
         if ov:
@@ -242,6 +248,16 @@ async def api_execute(req: ExecuteRequest):
                 estimated_delta=signal.get("estimated_delta",0),
                 deviations=[], created_at=int(time.time()))
             pm.add_position(sig)
+            # 回写实际成交的对冲量（hedge_ok 用成交 amount，hedge_skipped/失败则置 0），
+            # 保证后续平仓时对冲腿 amount 准确
+            hedge_inst = signal.get("hedge_instrument", "")
+            pos = pm.positions.get(signal["id"])
+            if pos and hedge_inst:
+                hr = results.get(hedge_inst, {})
+                if isinstance(hr, dict) and hr.get("status") == "hedge_ok":
+                    pos.hedge_amount = float(hr.get("amount", 0))
+                else:
+                    pos.hedge_amount = 0.0   # skipped / error / 未对冲
             # 执行后立即刷新 Greeks，避免前 30 秒显示 0
             try:
                 pm.update_greeks(state["latest_sabr_params"], state["latest_slices"])
@@ -366,3 +382,23 @@ async def api_gl_hedge_status(currency: str = "BTC"):
     if not gl:
         return {"status": "error", "message": "Not logged in"}
     return await gl.get_hedge_status(currency=currency)
+
+
+@app.post("/api/params")
+async def api_set_params(request: Request):
+    """前端动态设置扫描参数（覆盖 config 默认，主循环下一轮生效）"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    allowed = {"min_dte", "delta_min", "delta_max", "z_threshold", "min_oi"}
+    params = {k: body[k] for k in allowed if k in body}
+    state["runtime_params"].update(params)
+    logger.info(f"运行时参数更新: {params}")
+    return {"status": "ok", "runtime_params": state["runtime_params"]}
+
+
+@app.get("/api/params")
+async def api_get_params():
+    """获取当前运行时参数（前端初始化滑块用）"""
+    return {"runtime_params": state.get("runtime_params", {})}

@@ -172,32 +172,48 @@ class GreeksLiveHedge:
         except Exception as e:
             return {"status": "error", "message": str(e)}
 
+    async def _is_token_expired(self, result: dict) -> bool:
+        """判断响应是否为 token 过期/未授权"""
+        msg = str(result.get("message", "")).lower()
+        code = result.get("code")
+        return code in (401, 403) or "token" in msg or "auth" in msg or "unauthor" in msg
+
     async def get_hedge_status(self, currency: str) -> dict:
-        """查询对冲状态"""
+        """查询对冲状态（token 过期自动重登重试一次）"""
         if not self.account_id or not self.token:
-            return {"status": "error", "message": "Not ready"}
-        try:
-            async with self._session.post(
-                f"{TOOLS_URL}/strategy/get",
-                json={
-                    "account_id": self.account_id,
-                    "currency": currency,
-                    "strategy_type": "DynamicDeltaStrategy",
-                },
-                headers={"Authorization": self.token}
-            ) as resp:
-                result = await resp.json()
-                if result.get("code") == 200:
-                    data = result.get("data", {})
-                    return {
-                        "status": "ok",
-                        "is_run": data.get("is_run", False),
-                        "params": data.get("params", {}),
-                        "start_time": data.get("start_time"),
-                    }
-                return {"status": "error", "message": str(result)}
-        except Exception as e:
-            return {"status": "error", "message": str(e)}
+            # 未登录则尝试登录
+            if not await self.get_account_id():
+                return {"status": "error", "message": "Not ready"}
+        for attempt in range(2):
+            try:
+                async with self._session.post(
+                    f"{TOOLS_URL}/strategy/get",
+                    json={
+                        "account_id": self.account_id,
+                        "currency": currency,
+                        "strategy_type": "DynamicDeltaStrategy",
+                    },
+                    headers={"Authorization": self.token}
+                ) as resp:
+                    result = await resp.json()
+                    if result.get("code") == 200:
+                        data = result.get("data", {})
+                        return {
+                            "status": "ok",
+                            "is_run": data.get("is_run", False),
+                            "params": data.get("params", {}),
+                            "start_time": data.get("start_time"),
+                        }
+                    # token 过期则重登重试
+                    if attempt == 0 and await self._is_token_expired(result):
+                        logger.info("格致 token 过期，重新登录")
+                        if await self.login():
+                            await self.get_account_id()
+                            continue
+                    return {"status": "error", "message": str(result)}
+            except Exception as e:
+                return {"status": "error", "message": str(e)}
+        return {"status": "error", "message": "token 重登后仍失败"}
 
     async def close(self):
         if self._session:

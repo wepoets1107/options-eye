@@ -192,27 +192,3 @@ def build_chain_snapshot(
         ))
 
     return slices
-
-
-def get_delta_filtered_contracts(
-    slice_: ExpirySlice,
-    delta_min: float = 0.05,
-    delta_max: float = 0.25,
-    forward: Optional[float] = None
-) -> tuple[list[OptionContract], list[OptionContract]]:
-    """按 Delta 范围过滤合约（使用 moneyness 近似 Delta）"""
-    f = forward or slice_.forward
-    if f <= 0:
-        return slice_.calls, slice_.puts
-
-    def _in_delta_range(c: OptionContract) -> bool:
-        moneyness = c.strike / f
-        if c.kind == "call":
-            approx_d = max(0, 1.0 - moneyness * 0.8)
-        else:
-            approx_d = max(0, moneyness * 0.8 - 0.2)
-        return delta_min <= approx_d <= delta_max
-
-    calls = [c for c in slice_.calls if _in_delta_range(c)]
-    puts = [p for p in slice_.puts if _in_delta_range(p)]
-    return calls, puts
