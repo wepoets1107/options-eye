@@ -72,6 +72,7 @@ from pydantic import BaseModel
 
 class ExecuteRequest(BaseModel):
     signal_id: str
+    amount: int = 1  # 仓位倍数，默认 1 手
 
 
 class TradeCredentials(BaseModel):
@@ -122,8 +123,13 @@ async def startup():
                 # 自动启动 BTC 和 ETH 的 delta 对冲
                 for cur in ("BTC", "ETH"):
                     try:
-                        await gl.start_delta_hedge(currency=cur)
-                        logger.info(f"格致 delta 对冲已自动启动: {cur}")
+                        band = 0.05 if cur == "BTC" else 0.5
+                        await gl.start_delta_hedge(
+                            currency=cur,
+                            max_positive=band,
+                            max_negative=band
+                        )
+                        logger.info(f"格致 delta 对冲已自动启动: {cur} band=±{band}")
                     except Exception as e:
                         logger.warning(f"格致自动启动 {cur} 对冲失败: {e}")
     except Exception as e:
@@ -301,7 +307,20 @@ async def api_execute(req: ExecuteRequest):
         return {"status": "error", "message": "信号未确认，请先点击确认再执行"}
 
     try:
-        results = await trader.execute_signal(signal)
+        # 按仓位倍数放大 legs 和对冲量
+        mult = max(1, req.amount)
+        exec_signal = {
+            "id": signal["id"],
+            "currency": signal["currency"],
+            "legs": [
+                {**leg, "amount": leg.get("amount", 1) * mult}
+                for leg in signal.get("legs", [])
+            ],
+            "hedge_instrument": signal.get("hedge_instrument", ""),
+            "hedge_direction": signal.get("hedge_direction", ""),
+            "hedge_amount": (signal.get("hedge_amount", 0) or 0) * mult,
+        }
+        results = await trader.execute_signal(exec_signal)
         for s in state["latest_signals"]:
             if s["id"] == req.signal_id:
                 s["status"] = "executed"
@@ -313,11 +332,11 @@ async def api_execute(req: ExecuteRequest):
             sig = SignalModel(id=signal["id"], currency=signal["currency"],
                 strategy_type=signal["strategy_type"], direction=signal["direction"],
                 confidence=signal["confidence"], description=signal["description"],
-                legs=signal["legs"], hedge_instrument=signal.get("hedge_instrument",""),
-                hedge_direction=signal.get("hedge_direction",""),
-                hedge_amount=signal.get("hedge_amount",0),
-                expected_premium=signal.get("expected_premium",0),
-                estimated_delta=signal.get("estimated_delta",0),
+                legs=exec_signal["legs"], hedge_instrument=exec_signal.get("hedge_instrument",""),
+                hedge_direction=exec_signal.get("hedge_direction",""),
+                hedge_amount=exec_signal.get("hedge_amount",0),
+                expected_premium=(signal.get("expected_premium",0) or 0) * mult,
+                estimated_delta=(signal.get("estimated_delta",0) or 0) * mult,
                 deviations=[], created_at=int(time.time()))
             pm.add_position(sig)
             # 回写实际成交的对冲量
@@ -354,19 +373,60 @@ async def api_execute(req: ExecuteRequest):
 
 @app.get("/api/positions")
 async def api_positions():
-    """从 WebSocket 缓存读取实时持仓（零轮询）"""
+    """从交易所拉取持仓，含 Deribit 账户总 delta"""
     pm = state.get("position_manager")
     trader = state.get("trader")
     if not pm or not trader:
         return {"positions": [], "summary": {}}
     positions = await pm.refresh_from_exchange(trader)
     pos_dicts = [p.to_dict() for p in positions]
-    return {"positions": pos_dicts, "summary": pm.get_net_position(positions)}
+    summary = pm.get_net_position(positions)
+    # 从 Deribit 获取账户总 delta
+    try:
+        acc = await trader._send("private/get_account_summary", {
+            "currency": "BTC", "extended": True
+        })
+        if isinstance(acc, dict):
+            summary["delta_total"] = round(acc.get("delta_total", 0), 4)
+            summary["options_delta"] = round(acc.get("options_delta", 0), 4)
+    except Exception as e:
+        logger.warning(f"获取账户总 delta 失败: {e}")
+    # 追加永续合约持仓
+    try:
+        perp = await trader._send("private/get_positions", {
+            "currency": "BTC", "kind": "future"
+        })
+        perp_items = perp if isinstance(perp, list) else perp.get("result", [])
+        for item in perp_items:
+            inst = item.get("instrument_name", "")
+            size = item.get("size", 0)
+            if size == 0:
+                continue
+            pos_dicts.append({
+                "instrument": inst,
+                "kind": "future",
+                "size": size,
+                "delta": round(item.get("delta", 0), 4),
+                "mark_price": item.get("mark_price", 0),
+                "unrealized_pnl": round(item.get("floating_profit_loss", 0), 6),
+                "avg_price": item.get("average_price", 0),
+                "signal_id": "",
+                "strategy_type": "delta_hedge",
+                "direction": "short" if size < 0 else "long",
+                "currency": "BTC",
+                "description": "格致 delta 对冲（永续）",
+                "status": "open",
+                "executed_at": int(time.time()),
+                "last_update": int(time.time()),
+            })
+    except Exception as e:
+        logger.warning(f"获取永续持仓失败: {e}")
+    return {"positions": pos_dicts, "summary": summary}
 
 
 @app.post("/api/position/{signal_id}/close")
 async def api_close_position(signal_id: str):
-    """平仓：从信号元数据找到合约，反向平掉"""
+    """平仓：有 signal_id 按策略腿平仓，否则按 instrument 直接平"""
     pm = state.get("position_manager")
     trader = state.get("trader")
     results = {}
@@ -388,7 +448,6 @@ async def api_close_position(signal_id: str):
                     results[leg["instrument"]] = {"status": "ok", "order": r}
                 except Exception as e:
                     results[leg["instrument"]] = {"status": "error", "error": str(e)}
-            # 平掉永续对冲腿
             hm = pm._hedge_map.get(signal_id, {})
             hedge_inst = hm.get("instrument", "")
             hedge_amt = hm.get("amount", 0)
@@ -403,9 +462,30 @@ async def api_close_position(signal_id: str):
                     results[hedge_inst] = {"status": "ok", "order": r}
                 except Exception as e:
                     results[hedge_inst] = {"status": "error", "error": str(e)}
-
-    if pm:
-        pm.close_position(signal_id)
+            if pm:
+                pm.close_position(signal_id)
+        else:
+            # 没有 signal_id → 按 instrument 直接平仓
+            inst = signal_id
+            currency = inst.split("-")[0] if "-" in inst else "BTC"
+            try:
+                # 从交易所查持仓量
+                pos_result = await trader._send("private/get_position", {
+                    "instrument_name": inst
+                })
+                pos_data = pos_result if isinstance(pos_result, dict) else {}
+                size = abs(pos_data.get("size", 0))
+                if size > 0:
+                    close_dir = "sell" if pos_data.get("size", 0) > 0 else "buy"
+                    r = await trader.place_order(
+                        instrument=inst, direction=close_dir,
+                        amount=size, order_type="market"
+                    )
+                    results[inst] = {"status": "ok", "order": r}
+                else:
+                    results[inst] = {"status": "skipped", "reason": "无持仓"}
+            except Exception as e:
+                results[inst] = {"status": "error", "error": str(e)}
 
     # 同步停止该币种格致对冲
     gl = state.get("gl_hedge")

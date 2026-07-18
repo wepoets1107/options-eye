@@ -120,6 +120,9 @@ class PositionManager:
             for item in raw:
                 if item.get("kind") not in ("option",):
                     continue
+                # 过滤掉 size=0 或 direction=zero 的空持仓（已平仓的历史记录）
+                if item.get("size", 0) == 0 or item.get("direction") == "zero":
+                    continue
                 pos = Position(item)
                 # 匹配信号元数据
                 for sid, sig in list(self._signal_map.items()):

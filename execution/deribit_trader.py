@@ -208,12 +208,9 @@ class DeribitTrader:
 
     async def execute_signal(self, signal: dict) -> dict:
         """
-        执行策略信号
+        执行策略信号（期权腿由本函数下单，对冲由格致 Trial Forge 自动管理）
 
         signal["legs"] = [{instrument, direction, amount}, ...]
-        signal["hedge_instrument"] = "BTC-PERPETUAL"
-        signal["hedge_direction"] = "buy" / "sell"
-        signal["hedge_amount"] = float
         """
         results = {}
 
@@ -238,40 +235,8 @@ class DeribitTrader:
                 }
                 logger.error(f"Order failed: {leg['instrument']}: {e}")
 
-        # 2. 对冲 Delta（永续合约）：金额需满足最小合约单位
-        hedge_inst = signal.get("hedge_instrument")
-        hedge_dir = signal.get("hedge_direction")
-        hedge_amt = signal.get("hedge_amount")
-        if hedge_inst and hedge_dir and hedge_amt and hedge_amt > 0:
-            # 永续最小合约单位：BTC=10, ETH=1（Deribit 规则）
-            contract_size = 10 if str(hedge_inst).startswith("BTC") else 1
-            if hedge_amt < contract_size:
-                results[hedge_inst] = {
-                    "status": "hedge_skipped",
-                    "reason": f"对冲量 {hedge_amt:.4f} 小于最小单位 {contract_size}，跳过（放大交易规模后自动生效）"
-                }
-                logger.info(f"Hedge skipped for {hedge_inst}: amount {hedge_amt:.4f} < {contract_size}")
-            else:
-                rounded = round(hedge_amt / contract_size) * contract_size
-                try:
-                    result = await self.place_order(
-                        instrument=hedge_inst,
-                        direction=hedge_dir,
-                        amount=rounded,
-                        order_type="market"
-                    )
-                    results[hedge_inst] = {
-                        "status": "hedge_ok",
-                        "order": result,
-                        "amount": rounded
-                    }
-                    logger.info(f"Hedge: {hedge_dir} {rounded} {hedge_inst}")
-                except Exception as e:
-                    results[hedge_inst] = {
-                        "status": "hedge_error",
-                        "error": str(e)
-                    }
-
+        # 2. 对冲由格致 Trial Forge 自动管理
+        results["hedge"] = {"status": "delegated", "note": "格致 Trial Forge 自动对冲"}
         return results
 
     async def disconnect(self):
