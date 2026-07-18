@@ -116,7 +116,7 @@ class GreeksLiveHedge:
             "shortFuture": perpetual,
             "orderType": order_type,
             "makerEachOrderSize": 0.2,
-            "takerEachOrderSize": 0.05,
+            "takerEachOrderSize": 0.05 if currency == "BTC" else 0.1,
             "pos_mode": "all",
             "sel_pos_list": [],
             "ignore_pos_list": [],

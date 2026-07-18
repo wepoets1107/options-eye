@@ -190,10 +190,7 @@ async def main_loop(
                 z_threshold=z_threshold, delta_min=delta_min, delta_max=delta_max
             )
 
-            # 6. 更新 Geeks 持仓
-            pm = web_state.get("position_manager")
-            if pm and sabr_params:
-                pm.update_greeks(sabr_params, all_slices)
+            # 6. 更新 Greeks 已由 user.positions 推送实时更新，不再手动 sync
 
             # 7. 更新全局状态（Web 工作台读取）
             web_state["latest_slices"] = all_slices

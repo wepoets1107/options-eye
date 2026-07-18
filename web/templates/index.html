@@ -28,7 +28,7 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Ping
 .heatmap-wrapper { overflow-x: auto; padding-bottom: 6px; }
 .heatmap-table { border-collapse: separate; border-spacing: 3px; font-size: 13px; margin: 0 auto; }
 .heatmap-table th { padding: 6px 4px; text-align: center; font-weight: 600; color:#65718a; font-size: 12px; white-space: nowrap; position: sticky; top: 0; background: #fafbfc; z-index: 1; }
-.heatmap-table td { min-width: 66px; height: 46px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; transition: transform .1s; }
+.heatmap-table td { min-width: 66px; height: 46px; border-radius: 5px; cursor: pointer; font-size: 13px; font-weight: 600; font-variant-numeric: tabular-nums; transition: transform .1s; text-align: center; vertical-align: middle; }
 .heatmap-table td:hover { transform: scale(1.08); outline: 2px solid #2b5ca8; outline-offset: -2px; z-index: 3; position: relative; }
 .heatmap-table td.anomaly { outline: 2px solid #e53935; outline-offset: -2px; }
 .heatmap-table td.anomaly-neg { outline: 2px solid #1e88e5; outline-offset: -2px; }
@@ -324,6 +324,31 @@ async function fetchData() {
     renderHeatmap();
     renderSignals();
 
+    // 交易凭证状态（自动恢复提示，仅首次设置避免每 3s 覆盖已保存的状态）
+    var credEl = document.getElementById('cred-status');
+    if (stat.trader_ready) {
+      if (!credEl.textContent || credEl.textContent.indexOf('已') !== 0) {
+        credEl.textContent = '已连接（重启后自动恢复）';
+        credEl.style.color = '#1b9e57';
+      }
+    } else {
+      if (!credEl.textContent || credEl.textContent.indexOf('请') !== 0) {
+        credEl.textContent = '请填写测试网 Client ID 和 Secret';
+        credEl.style.color = '#c0392b';
+      }
+    }
+
+    // 格致对冲状态
+    var glStatusEl = document.getElementById('gl-status');
+    if (stat.gl_ready) {
+      if (!glStatusEl.textContent || glStatusEl.textContent.indexOf('已登录') !== 0) {
+        glStatusEl.textContent = '已登录（重启后自动恢复）';
+        glStatusEl.style.color = '#1b9e57';
+        // 自动查询对冲状态和参数
+        setTimeout(glStatus, 200);
+      }
+    }
+
   } catch(e) {
     console.log('fetch error:', e);
   }
@@ -343,7 +368,7 @@ function renderHeatmap() {
 
   var slices = currentData.slices.slices.filter(function(s) { return s.currency === selectedCurr; });
   var devs = currentData.devs.deviations || [];
-  var rows = slices.slice(0, 10);
+  var rows = slices;  // 全量到期日，不截断
   if (rows.length === 0) {
     container.innerHTML = '<div style="text-align:center;padding:50px;color:#9aa6ba;" class="loading">' + NO_DATA + '</div>';
     return;
@@ -395,7 +420,7 @@ function renderHeatmap() {
   html += '<th style="font-size:11px;color:#9aa6ba;">偏斜</th></tr></thead><tbody>';
 
   rows.forEach(function(r) {
-    html += '<tr><td style="font-weight:700;color:#65718a;text-align:right;padding-right:8px;font-size:12px;background:#f0f3f8;border-radius:5px;">' + r.dte + 'd</td>';
+    html += '<tr><td style="font-weight:700;color:#65718a;text-align:center;font-size:12px;background:#f0f3f8;border-radius:5px;">' + r.dte + 'd</td>';
 
     var allContracts = (r.calls || []).map(function(c) { c.absDelta = Math.abs(c.delta || 0); return c; })
       .concat((r.puts || []).map(function(p) { p.absDelta = Math.abs(p.delta || 0); return p; }));
@@ -605,28 +630,29 @@ async function refreshPositions() {
     html += '<div class="pos-summary">';
     html += '  <div class="cell"><div class="l">持仓数</div><div class="n">' + summary.count + '</div></div>';
     html += '  <div class="cell"><div class="l">Net Delta</div><div class="n" style="color:' + (summary.delta > 0.01 ? '#c62828' : summary.delta < -0.01 ? '#1565c0' : '#1f2733') + ';">' + summary.delta.toFixed(3) + '</div></div>';
+    html += '  <div class="cell"><div class="l">Net Gamma</div><div class="n">' + summary.gamma.toFixed(4) + '</div></div>';
     html += '  <div class="cell"><div class="l">Net Vega</div><div class="n">' + (summary.vega * 100).toFixed(0) + '</div></div>';
     html += '  <div class="cell"><div class="l">Net Theta</div><div class="n">' + (summary.theta * 100).toFixed(0) + '/d</div></div>';
-    html += '  <div class="cell"><div class="l">Bartlett Δ</div><div class="n" style="color:' + (summary.bartlett > 0.01 ? '#c62828' : summary.bartlett < -0.01 ? '#1565c0' : '#1f2733') + ';">' + summary.bartlett.toFixed(3) + '</div></div>';
-    html += '  <div class="cell"><div class="l">未实现盈亏</div><div class="n pnl-big" style="color:' + pnlColor(summary.pnl) + ';">' + fmtPnl(summary.pnl) + '</div></div>';
+    html += '  <div class="cell"><div class="l">未实现盈亏</div><div class="n pnl-big" style="color:' + pnlColor(summary.pnl) + ';">' + (summary.pnl > 0 ? '+' : '') + summary.pnl.toFixed(5) + '</div></div>';
     html += '</div>';
 
     // 逐笔持仓
     positions.forEach(function(p) {
       var dt = new Date(p.executed_at * 1000).toLocaleString();
+      var pnl = p.unrealized_pnl || 0;
+      var pnlStr = (pnl > 0 ? '+' : '') + pnl.toFixed(5);
       html += '<div class="pos-card">';
-      html += '  <div class="top"><div class="ttl">' + (p.direction === 'short' ? '做空' : '做多') + ' ' + p.strategy_type + ' | ' + p.currency + '</div>';
-      html += '    <div class="pnl-big" style="color:' + pnlColor(p.pnl) + ';">' + fmtPnl(p.pnl) + ' <span style="font-size:12px;font-weight:600;">(' + (p.pnl_pct>0?'+':'') + p.pnl_pct.toFixed(1) + '%)</span></div></div>';
+      html += '  <div class="top"><div class="ttl">' + (p.direction === 'short' ? '做空' : '做多') + ' ' + p.strategy_type + ' | ' + p.currency + ' | ' + p.instrument + '</div>';
+      html += '    <div class="pnl-big" style="color:' + pnlColor(pnl) + ';">' + pnlStr + '</div></div>';
       html += '  <div class="meta">' + p.description + '</div>';
       html += '  <div class="pos-grid">';
-      html += '    <div class="g"><div class="k">Delta</div><div class="v" style="color:' + (p.net_delta>0?'#c62828':p.net_delta<0?'#1565c0':'#1f2733') + ';">' + p.net_delta.toFixed(3) + '</div></div>';
-      html += '    <div class="g"><div class="k">Gamma</div><div class="v">' + p.net_gamma.toFixed(4) + '</div></div>';
-      html += '    <div class="g"><div class="k">Vega</div><div class="v">' + (p.net_vega * 100).toFixed(0) + '</div></div>';
-      html += '    <div class="g"><div class="k">Theta</div><div class="v">' + (p.net_theta * 100).toFixed(0) + '/d</div></div>';
-      html += '    <div class="g"><div class="k">Bartlett Δ</div><div class="v">' + p.bartlett_delta.toFixed(3) + '</div></div>';
-      html += '    <div class="g"><div class="k">入场权利金</div><div class="v">' + p.entry_premium.toFixed(5) + '</div></div>';
-      html += '    <div class="g"><div class="k">当前市值</div><div class="v">' + p.current_premium.toFixed(5) + '</div></div>';
-      html += '    <div class="g"><div class="k">对冲</div><div class="v">' + (p.hedge_active ? '格致' : '手动') + '</div></div>';
+      html += '    <div class="g"><div class="k">Delta</div><div class="v" style="color:' + (p.delta > 0.01 ? '#c62828' : p.delta < -0.01 ? '#1565c0' : '#1f2733') + ';">' + (p.delta || 0).toFixed(4) + '</div></div>';
+      html += '    <div class="g"><div class="k">Gamma</div><div class="v">' + (p.gamma || 0).toFixed(4) + '</div></div>';
+      html += '    <div class="g"><div class="k">Vega</div><div class="v">' + ((p.vega || 0) * 100).toFixed(0) + '</div></div>';
+      html += '    <div class="g"><div class="k">Theta</div><div class="v">' + ((p.theta || 0) * 100).toFixed(0) + '/d</div></div>';
+      html += '    <div class="g"><div class="k">入场均价</div><div class="v">' + (p.avg_price || 0).toFixed(1) + '</div></div>';
+      html += '    <div class="g"><div class="k">标记价格</div><div class="v">' + (p.mark_price || 0).toFixed(1) + '</div></div>';
+      html += '    <div class="g"><div class="k">持仓量</div><div class="v">' + p.size + '</div></div>';
       html += '  </div>';
       html += '  <div class="meta">' + dt + ' | ID: ' + p.signal_id.slice(0,8) + '</div>';
       html += '  <div class="actions" style="margin-top:8px;display:flex;gap:8px;">';

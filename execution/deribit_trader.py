@@ -31,13 +31,25 @@ class DeribitTrader:
         self._lock = asyncio.Lock()
         self._token: Optional[str] = None
         self._token_expiry: float = 0
+        # 持仓推送缓存（keyed by instrument_name），由 user.positions.* 订阅实时更新
+        self._position_cache: dict[str, dict] = {}
+        self._position_lock = asyncio.Lock()
 
     async def connect(self):
-        """建立连接并认证"""
+        """建立连接、认证、订阅用户数据推送、初始填充持仓缓存"""
         self.ws = await websockets.connect(self.url, ping_interval=30)
-        # 启动接收循环（否则 _send 发出去没人读响应）
         asyncio.create_task(self._recv_loop())
         await self._authenticate()
+        # 订阅持仓/订单/交易变更推送（实时，仅变动时推送）
+        try:
+            await self._send("private/subscribe", {
+                "channels": ["user.changes.any.any.raw"]
+            })
+            logger.info("已订阅 user.changes.any.any.raw（持仓变更推送）")
+        except Exception as e:
+            logger.warning(f"订阅 user.changes 失败: {e}")
+        # 初始填充持仓缓存（一次性，避免后续同步读取时阻塞事件循环）
+        await self._fetch_positions()
         logger.info("DeribitTrader authenticated")
 
     async def _authenticate(self):
@@ -82,9 +94,10 @@ class DeribitTrader:
         return result.get("result", {})
 
     async def _recv_loop(self):
-        """接收循环"""
+        """接收循环（处理请求响应 + subscription 推送）"""
         async for msg in self.ws:
             data = json.loads(msg)
+            # 请求响应
             if "id" in data and data["id"] in self._pending:
                 future = self._pending.pop(data["id"])
                 error = data.get("error")
@@ -92,6 +105,47 @@ class DeribitTrader:
                     future.set_exception(RuntimeError(str(error)))
                 else:
                     future.set_result(data)
+            # subscription 推送（user.changes / user.portfolio 等）
+            elif data.get("method") == "subscription":
+                params = data.get("params", {})
+                channel = params.get("channel", "")
+                payload = params.get("data", {})
+                if channel.startswith("user.changes."):
+                    async with self._position_lock:
+                        if isinstance(payload, dict):
+                            inst = payload.get("instrument_name", "")
+                            if inst:
+                                self._position_cache[inst] = payload
+                        elif isinstance(payload, list):
+                            for item in payload:
+                                inst = item.get("instrument_name", "")
+                                if inst:
+                                    self._position_cache[inst] = item
+
+    def get_cached_positions(self) -> list[dict]:
+        """获取缓存中的持仓列表。
+        初始数据在 connect() 时填充，后续由 user.changes 推送实时增量更新。零轮询。"""
+        return list(self._position_cache.values())
+
+    async def _fetch_positions(self):
+        """填充持仓缓存（一次性请求，仅缓存为空时调用）"""
+        for cur in ("BTC", "ETH"):
+            try:
+                result = await self._send("private/get_positions", {
+                    "currency": cur, "kind": "option"
+                })
+                items = result if isinstance(result, list) else result.get("result", [])
+                async with self._position_lock:
+                    for item in items:
+                        inst = item.get("instrument_name", "")
+                        if inst:
+                            self._position_cache[inst] = item
+            except Exception as e:
+                logger.warning(f"填充 {cur} 持仓缓存失败: {e}")
+
+    def get_cached_positions(self) -> list[dict]:
+        """获取缓存中的持仓列表（由 user.positions 推送实时更新）"""
+        return list(self._position_cache.values())
 
     async def get_order_state(self, order_id: str) -> dict:
         """查询订单状态"""

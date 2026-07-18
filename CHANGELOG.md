@@ -3,6 +3,14 @@
 遵循语义化版本（见 `version.py`）。每次修改后递增版本号。
 Semantic versioning (see `version.py`). Bump the version after every change.
 
+## [0.9.0] - 2026-07-18
+- **持仓数据改为交易所实时拉取**：position_manager 重写，从 Deribit private/get_positions 读取真实持仓，不再依赖本地内存记录。重启后持仓自动恢复。
+- **新增 user.changes 订阅**：交易 WebSocket 订阅 user.changes.any.any.raw 频道，持仓变更实时推送到缓存。首次连接时填充全量快照，后续增量更新，零轮询。
+- **凭证持久化**：Deribit 交易凭证 + 格致邮箱密码存入本地 .env 文件（.gitignore），每次重启自动加载，无需手动填写。
+- **格致对冲自动启动**：系统启动时自动登录格致并启动 BTC/ETH delta 对冲（takerEachOrderSize 按币种区分：BTC=0.05/ETH=0.1）。
+- **执行信号自动启动格致**：点击"执行"后若格致未启动则自动启动，已运行则跳过。
+- **前端持仓字段对齐**：更新 Position 字段名（delta/gamma/vega/theta/unrealized_pnl），修复持仓显示空白问题。
+
 ## [0.8.2] - 2026-07-18
 - **新增反向偏斜检测**：`_classify_deviation_pattern` 增加 `skew_put_cheap` / `skew_call_cheap` 判定（一侧 Z<-1.2 且另一侧高出至少 1.0），`_build_signal` 增加对应买卖逻辑（买便宜腿+卖相对贵腿）。覆盖整体 IV 偏低时一侧显著便宜的偏斜场景，信号数从 2 升至 5。
 

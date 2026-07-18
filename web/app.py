@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import yaml
 from pathlib import Path
@@ -18,6 +19,32 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="期权天眼")
+
+# .env 文件路径（不在 git 跟踪，存 Deribit 交易凭证自动恢复）
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+
+
+def _load_env_simple(path):
+    """简易 .env 解析器，不依赖 python-dotenv"""
+    env = {}
+    if not path.exists():
+        return env
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                k, v = line.split("=", 1)
+                env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
+
+
+def _save_env_simple(path, data):
+    """写入 .env 文件"""
+    with open(path, "w", encoding="utf-8") as f:
+        for k, v in data.items():
+            f.write(f'{k}={v}\n')
 
 # 全局状态（由 main.py 注入）
 state = {
@@ -59,10 +86,48 @@ class GlHedgeCredentials(BaseModel):
 
 @app.on_event("startup")
 async def startup():
+    """启动时自动加载凭证"""
     # 挂载静态文件
     static_dir = Path(__file__).parent / "static"
     static_dir.mkdir(exist_ok=True)
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    # 尝试从 .env 自动加载交易凭证
+    try:
+        env = _load_env_simple(ENV_PATH)
+        cid = env.get("DERIBIT_CLIENT_ID", "").strip()
+        sec = env.get("DERIBIT_CLIENT_SECRET", "").strip()
+        if cid and sec:
+            from execution.deribit_trader import DeribitTrader
+            trader = DeribitTrader(cid, sec, testnet=True)
+            await trader.connect()
+            state["trader"] = trader
+            state["client_id"] = cid
+            logger.info("已从 .env 自动加载交易凭证并连接")
+    except Exception as e:
+        logger.warning(f".env 自动加载交易凭证失败（可忽略，手动填写即可）: {e}")
+
+    # 尝试从 .env 自动登录格致对冲
+    try:
+        geli_email = env.get("GELI_EMAIL", "").strip()
+        geli_pwd = env.get("GELI_PASSWORD", "").strip()
+        if geli_email and geli_pwd:
+            from execution.greeks_live_hedge import GreeksLiveHedge
+            gl = GreeksLiveHedge(geli_email, geli_pwd)
+            ok = await gl.login()
+            if ok:
+                await gl.get_account_id()
+                state["gl_hedge"] = gl
+                logger.info(f"已从 .env 自动登录格致对冲，账户: {gl.account_id}")
+                # 自动启动 BTC 和 ETH 的 delta 对冲
+                for cur in ("BTC", "ETH"):
+                    try:
+                        await gl.start_delta_hedge(currency=cur)
+                        logger.info(f"格致 delta 对冲已自动启动: {cur}")
+                    except Exception as e:
+                        logger.warning(f"格致自动启动 {cur} 对冲失败: {e}")
+    except Exception as e:
+        logger.warning(f".env 自动登录格致失败（可忽略，手动登录即可）: {e}")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -84,6 +149,8 @@ async def api_status():
         "deviations": len(s["latest_deviations"]),
         "signals": len(s["latest_signals"]),
         "version": s.get("version", ""),
+        "trader_ready": s.get("trader") is not None,
+        "gl_ready": s.get("gl_hedge") is not None,
     }
 
 
@@ -173,15 +240,20 @@ async def api_signals():
 
 @app.post("/api/credentials")
 async def api_credentials(cred: TradeCredentials):
-    """设置 Deribit 交易凭证"""
+    """设置 Deribit 交易凭证（同时保存到 .env，重启后自动加载）"""
     try:
         from execution.deribit_trader import DeribitTrader
-        # 交易凭证默认连测试网（配置文件 testnet=false 只控制数据源）
         trader = DeribitTrader(cred.client_id, cred.client_secret, testnet=True)
         await trader.connect()
         state["trader"] = trader
         state["client_id"] = cred.client_id
-        return {"status": "ok", "message": "Trader connected"}
+        # 保存到 .env 以便重启后自动恢复
+        _save_env_simple(ENV_PATH, {
+            "DERIBIT_CLIENT_ID": cred.client_id,
+            "DERIBIT_CLIENT_SECRET": cred.client_secret,
+        })
+        logger.info("交易凭证已保存到 .env")
+        return {"status": "ok", "message": "Trader connected. Credentials saved to .env"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
@@ -248,8 +320,7 @@ async def api_execute(req: ExecuteRequest):
                 estimated_delta=signal.get("estimated_delta",0),
                 deviations=[], created_at=int(time.time()))
             pm.add_position(sig)
-            # 回写实际成交的对冲量（hedge_ok 用成交 amount，hedge_skipped/失败则置 0），
-            # 保证后续平仓时对冲腿 amount 准确
+            # 回写实际成交的对冲量
             hedge_inst = signal.get("hedge_instrument", "")
             pos = pm.positions.get(signal["id"])
             if pos and hedge_inst:
@@ -257,12 +328,24 @@ async def api_execute(req: ExecuteRequest):
                 if isinstance(hr, dict) and hr.get("status") == "hedge_ok":
                     pos.hedge_amount = float(hr.get("amount", 0))
                 else:
-                    pos.hedge_amount = 0.0   # skipped / error / 未对冲
-            # 执行后立即刷新 Greeks，避免前 30 秒显示 0
-            try:
-                pm.update_greeks(state["latest_sabr_params"], state["latest_slices"])
-            except Exception as e:
-                logger.warning(f"Immediate greeks update failed: {e}")
+                    pos.hedge_amount = 0.0
+            # 如果格致已登录，自动启动格致 delta 对冲（永续合约太小则走格致专业对冲）
+            gl = state.get("gl_hedge")
+            if gl and signal.get("currency"):
+                try:
+                    cur = signal["currency"]
+                    gs = await gl.get_hedge_status(currency=cur)
+                    if gs.get("status") == "ok" and not gs.get("is_run"):
+                        # 未启动才启动，避免重复
+                        await gl.start_delta_hedge(currency=cur)
+                        logger.info(f"格致对冲已自动启动: {cur}")
+                        if pos:
+                            pos.hedge_active = True
+                    elif gs.get("is_run"):
+                        if pos:
+                            pos.hedge_active = True
+                except Exception as e:
+                    logger.warning(f"自动启动格致对冲失败: {e}")
         return {"status": "ok", "results": results}
     except Exception as e:
         logger.error(f"Execute failed: {e}")
@@ -271,56 +354,64 @@ async def api_execute(req: ExecuteRequest):
 
 @app.get("/api/positions")
 async def api_positions():
+    """从 WebSocket 缓存读取实时持仓（零轮询）"""
     pm = state.get("position_manager")
-    if not pm:
+    trader = state.get("trader")
+    if not pm or not trader:
         return {"positions": [], "summary": {}}
-    return {"positions": pm.get_all_positions(), "summary": pm.get_net_position()}
+    positions = await pm.refresh_from_exchange(trader)
+    pos_dicts = [p.to_dict() for p in positions]
+    return {"positions": pos_dicts, "summary": pm.get_net_position(positions)}
 
 
 @app.post("/api/position/{signal_id}/close")
 async def api_close_position(signal_id: str):
-    """平仓：反向平掉期权腿 + 对冲腿，并停止格致对冲"""
+    """平仓：从信号元数据找到合约，反向平掉"""
     pm = state.get("position_manager")
-    pos = pm.positions.get(signal_id) if pm else None
     trader = state.get("trader")
     results = {}
+    currency = "BTC"
 
-    if pos and trader:
-        # 反向平掉每个期权腿
-        for leg in pos.legs:
-            close_dir = "sell" if leg.get("direction") == "buy" else "buy"
-            try:
-                r = await trader.place_order(
-                    instrument=leg["instrument"],
-                    direction=close_dir,
-                    amount=leg.get("amount", 1),
-                    order_type="market"
-                )
-                results[leg["instrument"]] = {"status": "ok", "order": r}
-            except Exception as e:
-                results[leg["instrument"]] = {"status": "error", "error": str(e)}
-        # 平掉对冲腿（永续）
-        if pos.hedge_instrument and pos.hedge_amount and pos.hedge_amount > 0:
-            hedge_close_dir = "sell" if pos.hedge_direction == "buy" else "buy"
-            try:
-                r = await trader.place_order(
-                    instrument=pos.hedge_instrument,
-                    direction=hedge_close_dir,
-                    amount=pos.hedge_amount,
-                    order_type="market"
-                )
-                results[pos.hedge_instrument] = {"status": "ok", "order": r}
-            except Exception as e:
-                results[pos.hedge_instrument] = {"status": "error", "error": str(e)}
+    if pm and trader:
+        signal = pm._signal_map.get(signal_id)
+        if signal:
+            currency = signal.currency
+            for leg in signal.legs:
+                close_dir = "sell" if leg.get("direction") == "buy" else "buy"
+                try:
+                    r = await trader.place_order(
+                        instrument=leg["instrument"],
+                        direction=close_dir,
+                        amount=leg.get("amount", 1),
+                        order_type="market"
+                    )
+                    results[leg["instrument"]] = {"status": "ok", "order": r}
+                except Exception as e:
+                    results[leg["instrument"]] = {"status": "error", "error": str(e)}
+            # 平掉永续对冲腿
+            hm = pm._hedge_map.get(signal_id, {})
+            hedge_inst = hm.get("instrument", "")
+            hedge_amt = hm.get("amount", 0)
+            hedge_dir = hm.get("direction", "")
+            if hedge_inst and hedge_amt and hedge_amt > 0:
+                close_dir = "sell" if hedge_dir == "buy" else "buy"
+                try:
+                    r = await trader.place_order(
+                        instrument=hedge_inst, direction=close_dir,
+                        amount=hedge_amt, order_type="market"
+                    )
+                    results[hedge_inst] = {"status": "ok", "order": r}
+                except Exception as e:
+                    results[hedge_inst] = {"status": "error", "error": str(e)}
 
     if pm:
         pm.close_position(signal_id)
 
     # 同步停止该币种格致对冲
     gl = state.get("gl_hedge")
-    if gl and pos:
+    if gl:
         try:
-            await gl.stop_delta_hedge(currency=pos.currency)
+            await gl.stop_delta_hedge(currency=currency)
         except Exception:
             pass
 
@@ -336,6 +427,12 @@ async def api_gl_hedge_login(cred: GlHedgeCredentials):
         if ok:
             await gl.get_account_id()
             state["gl_hedge"] = gl
+            # 保存到 .env
+            env = _load_env_simple(ENV_PATH)
+            env["GELI_EMAIL"] = cred.email
+            env["GELI_PASSWORD"] = cred.pwd
+            _save_env_simple(ENV_PATH, env)
+            logger.info("格致凭证已保存到 .env")
             return {"status": "ok", "account_id": gl.account_id}
         return {"status": "error", "message": "Login failed"}
     except Exception as e:
