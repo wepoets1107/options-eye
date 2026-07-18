@@ -3,6 +3,9 @@
 遵循语义化版本（见 `version.py`）。每次修改后递增版本号。
 Semantic versioning (see `version.py`). Bump the version after every change.
 
+## [0.8.2] - 2026-07-18
+- **新增反向偏斜检测**：`_classify_deviation_pattern` 增加 `skew_put_cheap` / `skew_call_cheap` 判定（一侧 Z<-1.2 且另一侧高出至少 1.0），`_build_signal` 增加对应买卖逻辑（买便宜腿+卖相对贵腿）。覆盖整体 IV 偏低时一侧显著便宜的偏斜场景，信号数从 2 升至 5。
+
 ## [0.8.1] - 2026-07-18
 - **修复热力图 IV 色阶 bug**：ABS 模式下颜色阈值硬编码（面向 BTC 的 30-45% IV 区间），导致 ETH（正常 IV 55-70%+）持续显示红色高估。改为按币种动态计算 IV 范围做相对色阶归一化（HSL 蓝→红渐变），图例同步显示币种名称与当前 IV 区间范围。
 

@@ -149,11 +149,17 @@ def _classify_deviation_pattern(expiry_deviations, log_mid_strike, delta_min=0.0
         else:
             return {"pattern": "underpriced", "confidence": "high" if (high_conf(z_avg) or avg_call_pt <= -4) else "medium", "z_avg": z_avg}
 
-    # 3. 偏斜检测：一侧显著高于另一侧（阈值 1.5→1.2，差值 1.5→1.0）
+    # 3. 偏斜检测：一侧显著高于另一侧（阈值 1.2，差值 1.0）
+    #    包括正向（一侧偏高）和反向（一侧偏低、另一侧正常）
     if avg_put_z > 1.2 and avg_call_z < avg_put_z - 1.0:
         return {"pattern": "skew_put_rich", "confidence": "high" if high_conf(avg_put_z) else "medium", "z_avg": avg_put_z}
     if avg_call_z > 1.2 and avg_put_z < avg_call_z - 1.0:
         return {"pattern": "skew_call_rich", "confidence": "high" if high_conf(avg_call_z) else "medium", "z_avg": avg_call_z}
+    # 反向偏斜：一侧偏低、另一侧相对正常
+    if avg_put_z < -1.2 and avg_call_z > avg_put_z + 1.0:
+        return {"pattern": "skew_put_cheap", "confidence": "high" if high_conf(avg_put_z) else "medium", "z_avg": avg_put_z}
+    if avg_call_z < -1.2 and avg_put_z > avg_call_z + 1.0:
+        return {"pattern": "skew_call_cheap", "confidence": "high" if high_conf(avg_call_z) else "medium", "z_avg": avg_call_z}
 
     # 4. 兜底曲率（近翼数据不够时，阈值同步动态化）
     if wing_calls and wing_puts:
@@ -375,6 +381,66 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             legs=[
                 {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
                 {"instrument": buy_leg.instrument, "direction": "buy", "amount": 1},
+            ],
+            hedge_instrument=f"{currency}-PERPETUAL",
+            hedge_direction="short", hedge_amount=0,
+            expected_premium=0, estimated_delta=0,
+            deviations=devs, created_at=now
+        )
+
+    elif pattern_type == "skew_put_cheap":
+        # Put 偏便宜 → 买最便宜的 put，卖 Delta 对称的 call（做多偏斜）
+        puts = sorted([d for d in devs if d.kind == "put"], key=lambda x: x.z_score)
+        calls = [d for d in devs if d.kind == "call"]
+        if not puts or not calls:
+            return None
+        buy_leg = puts[0]
+        sell_leg = _find_balanced_partner(buy_leg, calls)
+        if not sell_leg:
+            return None
+        return Signal(
+            id="", currency=currency,
+            strategy_type="risk_reversal", direction="long",
+            confidence=pattern["confidence"],
+            description=(
+                f"做多偏斜 {currency} {dte}d: "
+                f"买 {buy_leg.instrument} + 卖 {sell_leg.instrument} "
+                f"(Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, "
+                f"Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, Put偏低)"
+            ),
+            legs=[
+                {"instrument": buy_leg.instrument, "direction": "buy", "amount": 1},
+                {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
+            ],
+            hedge_instrument=f"{currency}-PERPETUAL",
+            hedge_direction="long", hedge_amount=0,
+            expected_premium=0, estimated_delta=0,
+            deviations=devs, created_at=now
+        )
+
+    elif pattern_type == "skew_call_cheap":
+        # Call 偏便宜 → 买最便宜的 call，卖 Delta 对称的 put（做空偏斜）
+        calls = sorted([d for d in devs if d.kind == "call"], key=lambda x: x.z_score)
+        puts = [d for d in devs if d.kind == "put"]
+        if not calls or not puts:
+            return None
+        buy_leg = calls[0]
+        sell_leg = _find_balanced_partner(buy_leg, puts)
+        if not sell_leg:
+            return None
+        return Signal(
+            id="", currency=currency,
+            strategy_type="risk_reversal", direction="short",
+            confidence=pattern["confidence"],
+            description=(
+                f"做空偏斜 {currency} {dte}d: "
+                f"买 {buy_leg.instrument} + 卖 {sell_leg.instrument} "
+                f"(Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, "
+                f"Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, Call偏低)"
+            ),
+            legs=[
+                {"instrument": buy_leg.instrument, "direction": "buy", "amount": 1},
+                {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
             ],
             hedge_instrument=f"{currency}-PERPETUAL",
             hedge_direction="short", hedge_amount=0,
