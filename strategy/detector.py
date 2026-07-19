@@ -183,9 +183,14 @@ def _finalize_signal(signal, slice_):
         c = cmap.get(l["instrument"])
         if not c:
             continue
-        sign = 1 if l["direction"] == "sell" else -1   # 现金流口径：卖=+收/买=-付
-        net_delta += sign * c.delta
-        prem += sign * (c.mark_price or 0) * l["amount"]
+        # 权利金符号：卖=+收权利金，买=-付权利金
+        cash_sign = 1 if l["direction"] == "sell" else -1
+        prem += cash_sign * (c.mark_price or 0) * l["amount"]
+        # Delta 符号：买=+（敞口与期权 delta 同向），卖=-（敞口与期权 delta 反向）
+        # 例：买 Put（Put delta=-0.11）→ 敞口 delta = +1 * (-0.11) = -0.11 ✓
+        # 例：卖 Call（Call delta=+0.16）→ 敞口 delta = -1 * (+0.16) = -0.16 ✓
+        pos_sign = 1 if l["direction"] == "buy" else -1
+        net_delta += pos_sign * c.delta
     signal.estimated_delta = round(net_delta, 4)
     signal.hedge_amount = round(abs(net_delta), 4)
     signal.hedge_direction = "long" if net_delta < 0 else "short"
@@ -329,7 +334,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
 
 
     elif pattern_type == "skew_put_rich":
-        # Put 偏贵 → 主腿 = Z 最高的 put（卖），辅腿 = Delta 对称的 call（买）
+        # Put 偏贵 → 卖最贵的 put + 买 Delta 对称的 call（做多偏斜 / 牛市 risk_reversal）
         puts = sorted([d for d in devs if d.kind == "put"], key=lambda x: -x.z_score)
         calls = [d for d in devs if d.kind == "call"]
         if not puts or not calls:
@@ -340,13 +345,13 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             return None
         return Signal(
             id="", currency=currency,
-            strategy_type="risk_reversal", direction="short",
+            strategy_type="risk_reversal", direction="long",
             confidence=pattern["confidence"],
             description=(
-                f"做空偏斜 {currency} {dte}d: "
+                f"做多偏斜 {currency} {dte}d: "
                 f"卖 {sell_leg.instrument} + 买 {buy_leg.instrument} "
                 f"(Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, "
-                f"Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)})"
+                f"Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, Put偏贵)"
             ),
             legs=[
                 {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
@@ -359,7 +364,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         )
 
     elif pattern_type == "skew_call_rich":
-        # Call 偏贵 → 主腿 = Z 最高的 call（卖），辅腿 = Delta 对称的 put（买）
+        # Call 偏贵 → 卖最贵的 call + 买 Delta 对称的 put（做空偏斜 / 熊市 risk_reversal）
         calls = sorted([d for d in devs if d.kind == "call"], key=lambda x: -x.z_score)
         puts = [d for d in devs if d.kind == "put"]
         if not calls or not puts:
@@ -370,13 +375,13 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             return None
         return Signal(
             id="", currency=currency,
-            strategy_type="risk_reversal", direction="long",
+            strategy_type="risk_reversal", direction="short",
             confidence=pattern["confidence"],
             description=(
-                f"做多偏斜 {currency} {dte}d: "
+                f"做空偏斜 {currency} {dte}d: "
                 f"卖 {sell_leg.instrument} + 买 {buy_leg.instrument} "
                 f"(Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, "
-                f"Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)})"
+                f"Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, Call偏贵)"
             ),
             legs=[
                 {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
@@ -389,7 +394,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         )
 
     elif pattern_type == "skew_put_cheap":
-        # Put 偏便宜 → 买最便宜的 put，卖 Delta 对称的 call（做多偏斜）
+        # Put 偏便宜 → 买最便宜的 put，卖 Delta 对称的 call（做空偏斜 / 熊市 risk_reversal）
         puts = sorted([d for d in devs if d.kind == "put"], key=lambda x: x.z_score)
         calls = [d for d in devs if d.kind == "call"]
         if not puts or not calls:
@@ -400,10 +405,10 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             return None
         return Signal(
             id="", currency=currency,
-            strategy_type="risk_reversal", direction="long",
+            strategy_type="risk_reversal", direction="short",
             confidence=pattern["confidence"],
             description=(
-                f"做多偏斜 {currency} {dte}d: "
+                f"做空偏斜 {currency} {dte}d: "
                 f"买 {buy_leg.instrument} + 卖 {sell_leg.instrument} "
                 f"(Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, "
                 f"Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, Put偏低)"
@@ -419,7 +424,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         )
 
     elif pattern_type == "skew_call_cheap":
-        # Call 偏便宜 → 买最便宜的 call，卖 Delta 对称的 put（做空偏斜）
+        # Call 偏便宜 → 买最便宜的 call，卖 Delta 对称的 put（做多偏斜 / 牛市 risk_reversal）
         calls = sorted([d for d in devs if d.kind == "call"], key=lambda x: x.z_score)
         puts = [d for d in devs if d.kind == "put"]
         if not calls or not puts:
@@ -430,10 +435,10 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             return None
         return Signal(
             id="", currency=currency,
-            strategy_type="risk_reversal", direction="short",
+            strategy_type="risk_reversal", direction="long",
             confidence=pattern["confidence"],
             description=(
-                f"做空偏斜 {currency} {dte}d: "
+                f"做多偏斜 {currency} {dte}d: "
                 f"买 {buy_leg.instrument} + 卖 {sell_leg.instrument} "
                 f"(Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, "
                 f"Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, Call偏低)"

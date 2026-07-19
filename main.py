@@ -1,7 +1,7 @@
 """
 期权天眼 — 主入口
 
-启动 Deribit WebSocket 数据流、SABR 校准引擎、信号引擎和 Web 工作台
+启动 Deribit WebSocket 数据流、SABR 校准引擎、信号引擎、推送通知和 Web 工作台
 """
 import asyncio
 import logging
@@ -18,6 +18,9 @@ from data.chain_cache import build_chain_snapshot
 from version import __version__ as APP_VERSION
 from sabr.calibrator import calibrate_all
 from strategy.detector import detect_deviations, generate_signals
+from notification.notifier import NotificationManager
+from notification.bnb_client import RollingMarket, BinanceFuturesClient
+from notification.expiry_scorer import ExpiryScorer
 
 logger = logging.getLogger(__name__)
 
@@ -203,10 +206,49 @@ async def main_loop(
                 for s in signals:
                     logger.info(f"信号: {s.description}")
 
+            # 8. 推送通知（异步，不阻塞主循环）
+            nf = web_state.get("notifier")
+            if nf:
+                signal_dicts = [s.__dict__ for s in signals]
+                asyncio.create_task(nf.push_sabr_signals(signal_dicts))
+
         except Exception as e:
             logger.error(f"主循环异常: {e}", exc_info=True)
 
         await asyncio.sleep(max(1, scan_cfg.get("signal_interval_sec", 30)))
+
+
+async def expiry_eval_loop(web_state: dict):
+    """末日期权评分循环"""
+    while True:
+        try:
+            scorer = web_state.get("expiry_scorer")
+            ws = web_state.get("deribit_ws")
+            notif = web_state.get("notifier")
+            if not scorer or not ws or not notif:
+                await asyncio.sleep(10)
+                continue
+
+            # 从 deribit_ws 取指数价格
+            idx = ws.index_price.get("btc_usd", 0) if hasattr(ws, "index_price") else 0
+
+            # 拉 Deribit 期权 book_summary
+            opts = []
+            try:
+                raw = await ws.get_book_summary_by_currency("BTC")
+                opts = raw if isinstance(raw, list) else []
+            except Exception:
+                pass
+
+            if idx and opts:
+                scorer.update_deribit(idx, opts)
+                sig = scorer.evaluate()
+                if sig:
+                    logger.info(f"末日期权信号: {sig['signal']} conf={sig['confidence']}")
+                    asyncio.create_task(notif.push_expiry_signal(sig))
+        except Exception as e:
+            logger.warning(f"末日期权评分异常: {e}")
+        await asyncio.sleep(15)  # 每15秒评估一次
 
 
 async def main():
@@ -244,8 +286,25 @@ async def main():
     web_state["is_running"] = True
     web_state["version"] = APP_VERSION
 
+    # 初始化推送通知
+    notifier = NotificationManager(config)
+    web_state["notifier"] = notifier
+    logger.info(f"推送通知模块已初始化 (enabled={notifier.enabled})")
+
+    # 初始化末日期权评分
+    market = RollingMarket()
+    expiry_scorer = ExpiryScorer(market)
+    web_state["expiry_scorer"] = expiry_scorer
+    bnb_client = BinanceFuturesClient(market)
+    web_state["bnb_client"] = bnb_client
+    asyncio.create_task(bnb_client.run())
+    logger.info("末日期权评分模块已初始化 (等待 Binance WS 数据积累)")
+
     # 启动主循环（后台）
     asyncio.create_task(main_loop(ws, config, web_state))
+
+    # 启动末日期权评分（后台）
+    asyncio.create_task(expiry_eval_loop(web_state))
 
     # 启动 Web 服务器
     web_cfg = config.get("web", {})

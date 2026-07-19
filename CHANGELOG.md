@@ -3,6 +3,15 @@
 遵循语义化版本（见 `version.py`）。每次修改后递增版本号。
 Semantic versioning (see `version.py`). Bump the version after every change.
 
+## [0.10.0] - 2026-07-19
+- **推送通知模块**：新增 notification/ 模块，整合邮件（QQ Agent Mail）、电报、微信三种推送通道（store.py/notifier.py/channels/email.py）。
+- **SABR 信号推送**：三星信号自动推送至邮箱，按 signal_id 去重（同信号每天只推一次），不同信号各自独立推送。
+- **末日期权买方信号集成**：从 btc-expiry-option-buyer-signal 移植评分引擎（expiry_scorer.py），接入 Binance 永续 WS 数据（bnb_client.py），与期权天眼同进程运行。
+- **Delta 符号修复**：\_finalize_signal 中 delta 计算改为持仓方向符号（买=+1，卖=-1），修复买Put+卖Call 的 delta 显示正值的问题。
+- **方向/描述修正**：skew_put_cheap/skew_call_cheap/skew_put_rich/skew_call_rich 四个模式的 direction/description 全部修正。
+- **权利金修复**：补回 expected_premium 赋值行，修复权利金始终显示 0 的 bug。
+- **消息格式优化**：信号描述分段换行，文尾加 Z 值说明和 delta 中性对冲说明。
+
 ## [0.9.0] - 2026-07-18
 - **持仓数据改为交易所实时拉取**：position_manager 重写，从 Deribit private/get_positions 读取真实持仓，不再依赖本地内存记录。重启后持仓自动恢复。
 - **新增 user.changes 订阅**：交易 WebSocket 订阅 user.changes.any.any.raw 频道，持仓变更实时推送到缓存。首次连接时填充全量快照，后续增量更新，零轮询。

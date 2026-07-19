@@ -6,8 +6,13 @@ env/
 # 运行日志 / 临时探测脚本
 logs/
 *.log
+_*body_*.txt
 _probe_*.py
 run_v*.log
+
+# 运行时状态（推送记录、信号日志等）
+data/pushed_signals.json
+data/notifications.jsonl
 
 # 本地配置（含本机设置，不提交；请用 config.example.yaml）
 config.yaml
