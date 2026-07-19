@@ -96,23 +96,42 @@ class DeribitWS:
         asyncio.create_task(self._control_recv_loop())
 
     async def _control_recv_loop(self):
-        try:
-            async for msg in self.ws:
-                data = json.loads(msg)
-                await self._handle_control(data)
-        except Exception as e:
-            logger.error(f"控制连接 recv 错误: {e}")
-            self._running = False
-            await asyncio.sleep(3)
-            asyncio.create_task(self._reconnect_main())
+        while True:
+            try:
+                async for msg in self.ws:
+                    data = json.loads(msg)
+                    await self._handle_control(data)
+            except Exception as e:
+                logger.error(f"控制连接 recv 错误: {e}")
+                self._running = False
+                # 清理悬空的 pending futures（连接断线后永远不会收到响应）
+                for rid, fut in list(self._pending.items()):
+                    if not fut.done():
+                        fut.set_exception(ConnectionError("控制连接已断开"))
+                    self._pending.pop(rid, None)
+                await asyncio.sleep(3)
+                await self._reconnect_main()
 
     async def _reconnect_main(self):
         logger.info("控制连接重连中...")
+        for attempt in range(10):
+            try:
+                await self._connect_main()
+                await self.subscribe_index()
+                return
+            except Exception as e:
+                logger.error(f"控制重连第{attempt+1}次失败: {e}")
+                await asyncio.sleep(min(5 * (attempt + 1), 30))
+        logger.error("控制连接重连已达到最大尝试次数")
+        # 最后一次尝试：重新创建整个ws对象
         try:
-            await self._connect_main()
+            self.ws = await websockets.connect(self.url, ping_interval=30)
+            self._running = True
+            asyncio.create_task(self._control_recv_loop())
             await self.subscribe_index()
+            logger.info("控制连接最终重连成功")
         except Exception as e:
-            logger.error(f"控制重连失败: {e}")
+            logger.error(f"控制连接最终重连也失败: {e}")
 
     async def _handle_control(self, data: dict):
         # 请求响应
@@ -131,15 +150,23 @@ class DeribitWS:
 
     async def _send(self, method: str, params: dict = None, timeout: float = 10.0) -> dict:
         """控制连接请求（带超时）"""
+        if not self._running or not self.ws:
+            raise ConnectionError("控制连接未就绪")
         async with self._lock:
             self._req_id += 1
             rid = self._req_id
             fut = asyncio.get_running_loop().create_future()
             self._pending[rid] = fut
-            await self.ws.send(json.dumps({
-                "jsonrpc": "2.0", "id": rid,
-                "method": method, "params": params or {}
-            }))
+            try:
+                await self.ws.send(json.dumps({
+                    "jsonrpc": "2.0", "id": rid,
+                    "method": method, "params": params or {}
+                }))
+            except Exception as e:
+                self._pending.pop(rid, None)
+                if not fut.done():
+                    fut.cancel()
+                raise ConnectionError(f"发送失败: {e}")
         try:
             res = await asyncio.wait_for(fut, timeout)
         except asyncio.TimeoutError:
@@ -163,10 +190,8 @@ class DeribitWS:
         logger.info("已订阅指数价格")
 
     async def get_index_price(self, index: str) -> Optional[float]:
-        if self.index_price.get(index):
-            return self.index_price[index]
-        r = await self._send("public/get_index_price", {"index_name": index})
-        return r.get("index_price")
+        # 仅读缓存，不发起网络请求（指数价走推送，REST兜底会触发WS超时）
+        return self.index_price.get(index)
 
     # ============ 合约列表 ============
     async def get_instruments(self, currency: str) -> list[dict]:

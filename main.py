@@ -131,8 +131,8 @@ async def main_loop(
             max_age = sabr_cfg.get("max_data_age_minutes", 5) * 60
             raw = ws.get_all_ticker(max_age)
 
-            # BTC
-            btc_price = ws.index_price.get("btc_usdc") or await ws.get_index_price("btc_usdc")
+            # BTC（指数价仅读缓存，不触发网络请求；缓存为空时用上次价格兜底）
+            btc_price = ws.index_price.get("btc_usdc") or web_state.get("_prev_btc_price", 0)
             btc_slices = build_chain_snapshot(
                 raw, btc_price or 0, "BTC",
                 min_dte=rp_dte,
@@ -141,7 +141,7 @@ async def main_loop(
             )
 
             # ETH
-            eth_price = ws.index_price.get("eth_usdc") or await ws.get_index_price("eth_usdc")
+            eth_price = ws.index_price.get("eth_usdc") or web_state.get("_prev_eth_price", 0)
             eth_slices = build_chain_snapshot(
                 raw, eth_price or 0, "ETH",
                 min_dte=rp_dte,
@@ -205,6 +205,12 @@ async def main_loop(
             if signals:
                 for s in signals:
                     logger.info(f"信号: {s.description}")
+
+            # 保存本次价格供下次兜底
+            if btc_price:
+                web_state["_prev_btc_price"] = btc_price
+            if eth_price:
+                web_state["_prev_eth_price"] = eth_price
 
             # 8. 推送通知（异步，不阻塞主循环）
             nf = web_state.get("notifier")
