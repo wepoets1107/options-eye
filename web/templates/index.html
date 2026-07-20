@@ -186,6 +186,13 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Ping
       </div>
     </div>
 
+    <div class="card" id="expiry-card">
+      <div class="card-header">末日期权买方信号 <span id="expiry-status" style="font-weight:400;color:#9aa6ba;"></span></div>
+      <div class="card-body" id="expiry-body">
+        <div style="text-align:center;padding:24px;color:#9aa6ba;" class="loading">等待数据...</div>
+      </div>
+    </div>
+
     <!-- 策略持仓管理 -->
     <div class="card" id="positions-card">
       <div class="card-header">
@@ -288,11 +295,12 @@ loadParams();
 // ---- 数据轮询 ----
 async function fetchData() {
   try {
-    var [stat, slices, devs, signals] = await Promise.all([
+    var [stat, slices, devs, signals, expiry] = await Promise.all([
       fetch('/api/status').then(function(r) { return r.json(); }),
       fetch('/api/slices').then(function(r) { return r.json(); }),
       fetch('/api/deviations').then(function(r) { return r.json(); }),
       fetch('/api/signals').then(function(r) { return r.json(); }),
+      fetch('/api/expiry').then(function(r) { return r.json(); }),
     ]);
 
     document.getElementById('stat-slices').textContent = stat.slices;
@@ -323,6 +331,7 @@ async function fetchData() {
     currentData = {slices: slices, devs: devs, signals: signals};
     renderHeatmap();
     renderSignals();
+    renderExpiry(expiry);
 
     // 交易凭证状态（自动恢复提示，仅首次设置避免每 3s 覆盖已保存的状态）
     var credEl = document.getElementById('cred-status');
@@ -356,6 +365,83 @@ async function fetchData() {
 
 setInterval(fetchData, 3000);
 fetchData();
+
+// ---- 末日期权买方信号 ----
+function renderExpiry(d) {
+  var box = document.getElementById('expiry-body');
+  var stEl = document.getElementById('expiry-status');
+  if (!d || !d.updated_ts) {
+    box.innerHTML = '<div style="text-align:center;padding:24px;color:#9aa6ba;" class="loading">等待数据...</div>';
+    if (stEl) stEl.textContent = '';
+    return;
+  }
+  var sig = d.last_signal || 'NO_TRADE';
+  var sigColor = sig === 'BUY_CALL' ? '#1b9e57' : sig === 'BUY_PUT' ? '#c0392b' : sig === 'BUY_STRADDLE' ? '#e08e0b' : '#9aa6ba';
+  var sigText = {BUY_CALL:'买入 Call', BUY_PUT:'买入 Put', BUY_STRADDLE:'双买', NO_TRADE:'无信号'}[sig] || sig;
+
+  function has(x){ return x !== undefined && x !== null && !Number.isNaN(Number(x)); }
+  function pct(x){ return has(x) ? (x*100).toFixed(1)+'%' : '--'; }
+  function num(x, dec){ dec = dec || 0; return has(x) ? Number(x).toLocaleString(undefined, {maximumFractionDigits: dec}) : '--'; }
+  function signed(x){ return has(x) ? ((x>=0?'+':'') + (x*100).toFixed(2) + '%') : '--'; }
+  function bar(label, v, color){
+    var ok = has(v);
+    var w = ok ? Math.max(0, Math.min(100, v)) : 0;
+    return '<div style="margin:6px 0;">'
+      + '<div style="display:flex;justify-content:space-between;font-size:13px;"><span>'+label+'</span><b style="font-variant-numeric:tabular-nums;">'+(ok?Math.round(v):'--')+'</b></div>'
+      + '<div style="height:8px;background:#eef1f5;border-radius:6px;overflow:hidden;margin-top:3px;"><div style="height:100%;width:'+w+'%;background:'+color+';border-radius:6px;transition:width .4s;"></div></div>'
+      + '</div>';
+  }
+
+  var html = '';
+  html += '<div style="display:flex;align-items:center;gap:12px;margin-bottom:8px;">';
+  html += '<span style="font-size:20px;font-weight:800;color:'+sigColor+';">'+sigText+'</span>';
+  if (d.confidence) html += '<span style="font-size:12px;color:#65718a;">强度 '+d.confidence+'</span>';
+  html += '</div>';
+  if (d.contract) html += '<div style="font-size:13px;color:#44506a;margin-bottom:8px;">合约: '+d.contract+'</div>';
+
+  html += '<div class="status-bar" style="margin-bottom:10px;">'
+        + '<span>现价 <b>'+num(d.price,0)+'</b></span>'
+        + '<span>VWAP <b>'+num(d.vwap,0)+'</b></span>'
+        + (has(d.minutes_left) ? '<span>剩余 <b>'+num(d.minutes_left,0)+'</b> 分</span>' : '')
+        + (has(d.same_day_options) ? '<span>末日期权 <b>'+d.same_day_options+'</b></span>' : '')
+        + '</div>';
+
+  html += '<div style="margin-bottom:10px;">';
+  html += bar('Call Score', d.call_score, '#1b9e57');
+  html += bar('Put Score', d.put_score, '#c0392b');
+  html += bar('双买 Score', d.straddle_score, '#e08e0b');
+  html += '</div>';
+
+  html += '<div class="status-bar" style="margin-bottom:8px;">'
+        + '<span>5m <b>'+signed(d.r5)+'</b></span>'
+        + '<span>15m <b>'+signed(d.r15)+'</b></span>'
+        + '<span>量比 <b>'+(has(d.vol_ratio)?num(d.vol_ratio,2)+'x':'--')+'</b></span>'
+        + '<span>主动买 <b>'+pct(d.taker_buy_ratio)+'</b></span>'
+        + '<span>PCR <b>'+(has(d.pcr)?num(d.pcr,2):'--')+'</b></span>'
+        + '<span>ATM IV <b>'+(has(d.atm_iv)?num(d.atm_iv,1)+'%':'--')+'</b></span>'
+        + '</div>';
+
+  if (sig === 'NO_TRADE' && d.straddle_blocked) {
+    html += '<div style="font-size:12px;color:#9aa6ba;margin-bottom:6px;">双买未触发：'+((d.straddle_blockers||[]).join('、')||'条件未满足')+'</div>';
+  }
+
+  var reasons = d.last_reasons || [];
+  if (reasons.length) {
+    html += '<div style="font-size:12px;color:#65718a;margin-top:4px;">触发原因：</div><ul style="margin:4px 0 0 18px;font-size:12px;color:#44506a;line-height:1.6;">';
+    reasons.forEach(function(r){ html += '<li>'+r+'</li>'; });
+    html += '</ul>';
+  }
+
+  html += '<div style="font-size:11px;color:#aab4c4;margin-top:10px;">更新：'+(d.updated_at||'--')+(d.status?(' · '+d.status):'')+'</div>';
+  box.innerHTML = html;
+  if (stEl) {
+    if (d.status === 'warming_up') stEl.textContent = '预热中';
+    else if (d.status === 'waiting_deribit') stEl.textContent = '等待 Deribit';
+    else if (d.status === 'no_expiry_options') stEl.textContent = '无末日期权';
+    else if (d.status === 'expiry_passed') stEl.textContent = '无临近到期';
+    else stEl.textContent = '';
+  }
+}
 
 // ---- 热力图 ----
 function renderHeatmap() {

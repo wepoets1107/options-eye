@@ -273,6 +273,7 @@ async def expiry_eval_loop(web_state: dict):
                 m = scorer.market
                 logger.info(f"末日期权评估: K线={len(m.closes)} 成交={len(m.trades)}")
                 sig = scorer.evaluate()
+                web_state["expiry_state"] = scorer.last_scores
                 if sig:
                     logger.info(f"末日期权信号: {sig['signal']} conf={sig['confidence']}")
                     asyncio.create_task(notif.push_expiry_signal(sig))
@@ -346,6 +347,7 @@ async def main():
 
     expiry_scorer = ExpiryScorer(market)
     web_state["expiry_scorer"] = expiry_scorer
+    web_state["expiry_state"] = {}
     bnb_client = BinanceFuturesClient(market)
     web_state["bnb_client"] = bnb_client
     asyncio.create_task(bnb_client.run())

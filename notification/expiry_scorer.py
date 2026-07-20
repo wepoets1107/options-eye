@@ -73,6 +73,7 @@ class ExpiryScorer:
         self.options: list = []  # Deribit book_summary 列表
         self.updated_ms = 0
         self.last_signal: Optional[dict] = None
+        self.last_scores: dict = {}  # 每轮评分快照，供 Web 前端轮询（未触发也写）
         self._atm_call = None
         self._atm_put = None
 
@@ -429,21 +430,73 @@ class ExpiryScorer:
         }
 
     def evaluate(self) -> Optional[dict]:
-        """主评估方法，返回信号 dict 或 None"""
+        """主评估方法，返回信号 dict 或 None。
+
+        无论是否触发信号，都会把本轮评分写入 self.last_scores，供 Web 前端实时展示。
+        """
         if not self.fresh():
+            self.last_scores = {
+                "status": "waiting_deribit",
+                "updated_at": fmt_ts(),
+                "updated_ts": time.time(),
+                "message": "等待 Deribit 期权数据",
+                "price": self.index_price or getattr(self.market, "last_price", 0),
+                "last_signal": "NO_TRADE",
+                "last_reasons": [],
+            }
             return None
 
         min_closes = 65
         min_trades = 20
         if len(self.market.closes) < min_closes or len(self.market.trades) < min_trades:
+            price = self.index_price or getattr(self.market, "last_price", 0)
+            try:
+                vwap = self.market.vwap() or price
+            except Exception:
+                vwap = price
+            try:
+                taker = self.market.taker_ratio_5m()
+            except Exception:
+                taker = None
+            self.last_scores = {
+                "status": "warming_up",
+                "updated_at": fmt_ts(),
+                "updated_ts": time.time(),
+                "message": f"K线/成交积累中：1m K线 {len(self.market.closes)}/{min_closes}，成交 {len(self.market.trades)}/{min_trades}",
+                "price": price,
+                "vwap": vwap,
+                "taker_buy_ratio": taker,
+                "same_day_options": len(self._same_day_options()),
+                "last_signal": "NO_TRADE",
+                "last_reasons": [],
+            }
             return None
 
         same_day = self._same_day_options()
         if not same_day:
+            self.last_scores = {
+                "status": "no_expiry_options",
+                "updated_at": fmt_ts(),
+                "updated_ts": time.time(),
+                "message": "当前筛选条件下无末日期权",
+                "price": self.index_price or getattr(self.market, "last_price", 0),
+                "last_signal": "NO_TRADE",
+                "last_reasons": [],
+            }
             return None
 
         mins_left = self._minutes_to_expiry()
         if mins_left < self.MIN_MINUTES:
+            self.last_scores = {
+                "status": "expiry_passed",
+                "updated_at": fmt_ts(),
+                "updated_ts": time.time(),
+                "message": f"无满足≥{self.MIN_MINUTES}分钟的末日期权",
+                "price": self.index_price or getattr(self.market, "last_price", 0),
+                "minutes_left": mins_left,
+                "last_signal": "NO_TRADE",
+                "last_reasons": [],
+            }
             return None
 
         call, put = self._score_direction()
@@ -483,6 +536,33 @@ class ExpiryScorer:
         put_final = max(0, min(100, put["score"]))
         straddle_final = max(0, min(100, straddle["score"]))
 
+        # 持续落盘：无论是否触发信号，都把本轮评分写入 self.last_scores 供前端读取
+        self.last_scores = {
+            "status": "running",
+            "updated_at": fmt_ts(),
+            "updated_ts": time.time(),
+            "price": call["metrics"].get("price", 0),
+            "vwap": call["metrics"].get("vwap", 0),
+            "r5": call["metrics"].get("r5", 0),
+            "r15": call["metrics"].get("r15", 0),
+            "vol_ratio": call["metrics"].get("vol_ratio", 0),
+            "taker_buy_ratio": call["metrics"].get("taker_buy_ratio", 0),
+            "minutes_left": mins_left,
+            "call_score": call_final,
+            "put_score": put_final,
+            "straddle_score": straddle_final,
+            "pcr": flow.get("pcr"),
+            "atm_iv": flow.get("atm_iv"),
+            "same_day_options": len(same_day),
+            "straddle_blocked": straddle.get("blocked"),
+            "straddle_blockers": straddle.get("blockers", [])[:3],
+            "call_reasons": call["reasons"],
+            "put_reasons": put["reasons"],
+            "straddle_reasons": straddle["reasons"],
+            "last_signal": "NO_TRADE",
+            "last_reasons": [],
+        }
+
         # 决策
         signal = None
         contract = None
@@ -507,6 +587,12 @@ class ExpiryScorer:
 
         if not signal:
             return None
+
+        # 命中信号：回填 self.last_scores 并推送
+        self.last_scores["last_signal"] = signal
+        self.last_scores["last_reasons"] = reasons[:8]
+        self.last_scores["contract"] = contract
+        self.last_scores["confidence"] = confidence
 
         result = {
             "signal": signal,

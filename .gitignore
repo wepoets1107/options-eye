@@ -37,3 +37,6 @@ __pycache__/
 
 # 代理内部记忆（非产品文件）
 .workbuddy/
+
+# 本机启动器（Windows 任务计划程序调用，不提交）
+start_service.bat

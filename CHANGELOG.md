@@ -1,5 +1,16 @@
 # 期权天眼 更新日志
 
+## 0.11.0 (2026-07-20) 末日期权买方信号前端模块
+
+前端新增「末日期权买方信号」模块（位于策略信号下方），实时展示评分，不再只等触发才推电报。
+
+### 新增
+- 评分引擎 `notification/expiry_scorer.py`：每轮评估都写 `self.last_scores`（含 Call/Put/双买评分、价格/VWAP、动量、PCR、ATM IV、剩余分钟、末日期权数、状态、触发原因），未触发也保留，last_signal 默认 `NO_TRADE`。
+- `main.py`：`expiry_eval_loop` 每轮把 `scorer.last_scores` 写入共享 `web_state["expiry_state"]`；启动时初始化该字段。
+- `web/app.py`：新增 `GET /api/expiry` 返回末日期权评分快照。
+- `web/templates/index.html`：新增「末日期权买方信号」卡片，轮询 `/api/expiry`（随主循环 3 秒刷新），展示信号、三评分进度条、动量/资金流、到期与样本、触发原因，预热/等待/无到期状态给出提示。
+- 模式对齐私有仓库 `btc-expiry-option-buyer-signal` 的「每轮落盘 + 前端轮询」方案。
+
 ## 0.10.1 (2026-07-20) 数据入口 Bug 修复
 
 交叉检查发现的 Bug 修复（详见代码注释）：

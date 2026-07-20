@@ -244,6 +244,12 @@ async def api_signals():
     return {"signals": sigs}
 
 
+@app.get("/api/expiry")
+async def api_expiry():
+    """获取末日期权买方信号评分快照（每轮评估都更新，未触发也返回实时分数）"""
+    return state.get("expiry_state", {})
+
+
 @app.post("/api/credentials")
 async def api_credentials(cred: TradeCredentials):
     """设置 Deribit 交易凭证（同时保存到 .env，重启后自动加载）"""
