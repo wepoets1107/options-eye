@@ -14,7 +14,9 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
-BINANCE_WS = "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@kline_1m/btcusdt@bookTicker/btcusdt@markPrice@1s"
+# 仅订阅真实数据源：aggTrade（成交）、kline_1m（OHLCV）、markPrice（标记价）
+# 不订阅 @bookTicker：它会用中间价涨跌伪造成交并覆盖真实成交量，污染评分
+BINANCE_WS = "wss://fstream.binance.com/stream?streams=btcusdt@aggTrade/btcusdt@kline_1m/btcusdt@markPrice@1s"
 
 SH_TZ = time.timezone if time.daylight else time.timezone
 
@@ -58,16 +60,7 @@ class RollingMarket:
 
         self.last_price = 0.0
         self.mark_price = 0.0
-        self.bid = 0.0
-        self.ask = 0.0
         self.index_price = 0.0  # 由 options-eye 的 deribit_ws 更新
-
-        self._book_minute = 0
-        self._book_open = 0.0
-        self._book_high = 0.0
-        self._book_low = 0.0
-        self._book_volume = 0.0
-        self._last_book_price = 0.0
 
     def add_trade(self, ts, price, qty, taker_side):
         self.last_price = price
@@ -87,30 +80,6 @@ class RollingMarket:
             self.volumes[-1] = (ts, volume)
         self.last_price = close
         self._update_bb_width()
-
-    def add_book_tick(self, ts, bid, ask, bid_qty=0.0, ask_qty=0.0):
-        if bid <= 0 or ask <= 0:
-            return
-        mid = (bid + ask) / 2
-        self.bid, self.ask, self.last_price = bid, ask, mid
-        minute = ts // 60000 * 60000
-        pseudo_qty = max(0.0, bid_qty + ask_qty) * 0.001
-        if self._book_minute != minute:
-            if self._book_minute and self._book_open > 0:
-                self.add_kline(self._book_minute, self._last_book_price or mid,
-                               self._book_high, self._book_low, self._book_volume)
-            self._book_minute = minute
-            self._book_open = self._book_high = self._book_low = mid
-            self._book_volume = pseudo_qty
-        else:
-            self._book_high = max(self._book_high, mid)
-            self._book_low = min(self._book_low, mid)
-            self._book_volume += pseudo_qty
-            self.add_kline(minute, mid, self._book_high, self._book_low, self._book_volume)
-        side = 1 if self._last_book_price and mid > self._last_book_price else -1 if self._last_book_price and mid < self._last_book_price else 0
-        if side:
-            self.add_trade(ts, mid, max(pseudo_qty, 0.0001), side)
-        self._last_book_price = mid
 
     def _trim_trades(self):
         cutoff = now_ms() - 2 * 60 * 60 * 1000
@@ -212,13 +181,6 @@ class BinanceFuturesClient:
                                                   safe_float(k.get("h")),
                                                   safe_float(k.get("l")),
                                                   safe_float(k.get("v")))
-                        elif stream.endswith("@bookTicker"):
-                            ts = int(data.get("T") or data.get("E") or now_ms())
-                            self.market.add_book_tick(ts,
-                                                      safe_float(data.get("b")),
-                                                      safe_float(data.get("a")),
-                                                      safe_float(data.get("B")),
-                                                      safe_float(data.get("A")))
                         elif stream.endswith("@markPrice@1s"):
                             self.market.mark_price = safe_float(data.get("p"))
             except Exception as e:

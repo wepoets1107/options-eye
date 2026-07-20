@@ -26,7 +26,8 @@ def _ensure_dir():
 def _cleanup_old(data: dict) -> int:
     """清理超过 RETENTION_DAYS 天的记录"""
     cutoff = time.time() - RETENTION_DAYS * 86400
-    cutoff_date = time.strftime("%Y-%m-%d", time.gmtime(cutoff))
+    # 用本地日期计算 cutoff，与 push_count_today / mark_pushed 的 key 保持一致
+    cutoff_date = time.strftime("%Y-%m-%d", time.localtime(cutoff))
     removed = 0
     for key in list(data.keys()):
         # 键格式：YYYY-MM-DD_xxx 或 YYYY-MM-DD

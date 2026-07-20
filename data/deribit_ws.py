@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 MAX_SUBS_PER_CONN = 200
 # 只使用 1 个连接，分批轮转采集（任何时候只订阅 1 批）
 MAX_TICKER_CONNS = 1
-# 每批采集时长（秒）：30秒太短导致频繁subscribe被限流，改为3分钟
-BATCH_DWELL_SEC = 180
+# 每批采集时长（秒）
+BATCH_DWELL_SEC = 30
 # ticker 推送间隔：Deribit 公共连接实测仅 100ms（及 raw 需认证）真正推送；
 # 1s / 5s / 1m 在公共 API 上均不推送，故默认 100ms。
 # illiquid 期权仅在变化时才推送，真实流量远小于频道数。
@@ -63,7 +63,7 @@ class DeribitWS:
         self._lock = asyncio.Lock()
         self._running = False
 
-        # 指数价格（deribit_price_index.raw 推送）
+        # 指数价格（deribit_price_index.{btc_usd,eth_usd} 推送）
         self.index_price: dict[str, float] = {}
 
         # ticker 推送缓存 —— 全系统唯一行情数据源（归一化后）
@@ -81,6 +81,9 @@ class DeribitWS:
         self._ticker_batch_idx: int = 0            # 当前批次索引
 
         self.on_chain_update = None  # 预留回调（当前主循环按周期读缓存，未使用）
+
+        # 轮转循环只启动一次（避免 contracts 刷新时重复 create_task）
+        self._rotation_started = False
 
     # ============ 连接管理 ============
     async def connect(self):
@@ -195,8 +198,12 @@ class DeribitWS:
 
     # ============ 指数 ============
     async def subscribe_index(self):
-        await self._send("public/subscribe", {"channels": ["deribit_price_index.raw"]})
-        logger.info("已订阅指数价格")
+        # 正确频道：deribit_price_index.btc_usd / deribit_price_index.eth_usd
+        # （裸 deribit_price_index.raw 在实盘无效，订阅返回空）
+        await self._send("public/subscribe", {
+            "channels": ["deribit_price_index.btc_usd", "deribit_price_index.eth_usd"]
+        })
+        logger.info("已订阅指数价格 (btc_usd / eth_usd)")
 
     async def get_index_price(self, index: str) -> Optional[float]:
         # 仅读缓存，不发起网络请求（指数价走推送，REST兜底会触发WS超时）
@@ -241,10 +248,12 @@ class DeribitWS:
             asyncio.create_task(self._ticker_connect(conn))
             await asyncio.sleep(0.2)
 
-        # 订阅第一批，启动轮转
+        # 订阅第一批，启动轮转（仅首次启动，刷新合约时不再重复 create_task）
         self._ticker_batch_idx = 0
         await self._switch_ticker_batch(0)
-        asyncio.create_task(self._ticker_rotation_loop())
+        if not self._rotation_started:
+            self._rotation_started = True
+            asyncio.create_task(self._ticker_rotation_loop())
 
     async def _switch_ticker_batch(self, batch_idx: int):
         """切换到指定批次"""
@@ -299,6 +308,9 @@ class DeribitWS:
     async def _ticker_connect(self, conn: _TickerConn, retry_count: int = 0):
         try:
             conn.ws = await websockets.connect(self.url, ping_interval=30)
+            # 重连后清空已订阅集合，强制下一轮轮转重新订阅（否则 subscribed
+            # 与 target 一致会判定为空操作，连接空转 → 看门狗反复重连）
+            conn.subscribed = set()
             conn.running = True
             logger.info(f"ticker 连接#{conn.idx} 已建立")
             await self._ticker_recv_loop(conn)

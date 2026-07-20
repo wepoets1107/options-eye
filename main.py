@@ -132,7 +132,7 @@ async def main_loop(
             raw = ws.get_all_ticker(max_age)
 
             # BTC（指数价仅读缓存，不触发网络请求；缓存为空时用上次价格兜底）
-            btc_price = ws.index_price.get("btc_usdc") or web_state.get("_prev_btc_price", 0)
+            btc_price = ws.index_price.get("btc_usd") or web_state.get("_prev_btc_price", 0)
             btc_slices = build_chain_snapshot(
                 raw, btc_price or 0, "BTC",
                 min_dte=rp_dte,
@@ -141,7 +141,7 @@ async def main_loop(
             )
 
             # ETH
-            eth_price = ws.index_price.get("eth_usdc") or web_state.get("_prev_eth_price", 0)
+            eth_price = ws.index_price.get("eth_usd") or web_state.get("_prev_eth_price", 0)
             eth_slices = build_chain_snapshot(
                 raw, eth_price or 0, "ETH",
                 min_dte=rp_dte,
@@ -235,21 +235,43 @@ async def expiry_eval_loop(web_state: dict):
                 await asyncio.sleep(10)
                 continue
 
-            # 从 deribit_ws 取指数价格
-            idx = ws.index_price.get("btc_usd", 0) if hasattr(ws, "index_price") else 0
+            # 从 deribit_ws 取指数价格（优先 WS 推送缓存，兜底 REST 直拉）
+            idx = 0
+            try:
+                if hasattr(ws, "index_price"):
+                    idx = ws.index_price.get("btc_usd", 0)
+                if not idx:
+                    import json, urllib.request
+                    r = urllib.request.urlopen(
+                        "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd",
+                        timeout=8
+                    )
+                    idx = json.loads(r.read())["result"]["index_price"]
+            except Exception:
+                pass
 
             # 拉 Deribit 期权 book_summary
             opts = []
             try:
                 raw = await ws.get_book_summary_by_currency("BTC")
-                opts = raw if isinstance(raw, list) else []
-            except Exception:
-                pass
+                raw_list = raw if isinstance(raw, list) else []
+                # book_summary 本身不带 greeks；用 ticker 推送缓存里的真实 greeks 补齐，
+                # 让末日期权评分的 _choose_option 能按 delta 选合约（否则走 moneyness 兜底）
+                for o in raw_list:
+                    name = o.get("instrument_name")
+                    c = ws.ticker_cache.get(name)
+                    g = c.get("greeks", {}) if c else {}
+                    o = dict(o)
+                    o["greeks"] = g
+                    opts.append(o)
+                logger.info(f"末日期权: {len(opts)} 合约, 指数={idx:.0f}")
+            except Exception as e:
+                logger.warning(f"末日期权拉取 Deribit 失败: {e}")
 
             if idx and opts:
                 scorer.update_deribit(idx, opts)
                 m = scorer.market
-                logger.info(f"末日期权评估: idx={idx:.0f} K线={len(m.closes)} 成交={len(m.trades)}")
+                logger.info(f"末日期权评估: K线={len(m.closes)} 成交={len(m.trades)}")
                 sig = scorer.evaluate()
                 if sig:
                     logger.info(f"末日期权信号: {sig['signal']} conf={sig['confidence']}")
@@ -305,6 +327,23 @@ async def main():
 
     # 初始化末日期权评分
     market = RollingMarket()
+    # 启动时从 Binance REST 回填历史 K 线和成交数据，避免等 65 分钟积累
+    try:
+        import json, urllib.request
+        url_k = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=70"
+        resp = urllib.request.urlopen(url_k, timeout=10)
+        for k in json.loads(resp.read().decode()):
+            market.add_kline(k[0], float(k[4]), float(k[2]), float(k[3]), float(k[5]))
+        # 拉最近 aggTrades 填充成交数据
+        url_t = "https://fapi.binance.com/fapi/v1/aggTrades?symbol=BTCUSDT&limit=50"
+        resp2 = urllib.request.urlopen(url_t, timeout=10)
+        for t in json.loads(resp2.read().decode()):
+            side = -1 if t.get("m") else 1
+            market.add_trade(int(t["T"]), float(t["p"]), float(t["q"]), side)
+        logger.info(f"末日期权历史回填完成: {len(market.closes)} K线, {len(market.trades)} 成交")
+    except Exception as e:
+        logger.warning(f"末日期权历史回填失败（等待 WS 实时积累）: {e}")
+
     expiry_scorer = ExpiryScorer(market)
     web_state["expiry_scorer"] = expiry_scorer
     bnb_client = BinanceFuturesClient(market)

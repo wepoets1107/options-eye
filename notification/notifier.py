@@ -5,6 +5,7 @@
     notifier = NotificationManager(config)
     await notifier.push_sabr_signals(signals_list)
 """
+import asyncio
 import logging
 import time
 from typing import Optional
@@ -32,6 +33,8 @@ class NotificationManager:
 
         # 进程内去重缓存（启动时从文件恢复，重启不丢失）
         self._pushed_this_run: set = set()
+        # 推送串行锁：防止同一批次在并发 create_task 下被重复发送
+        self._push_lock = asyncio.Lock()
         self._restore_pushed_state()
 
     def _restore_pushed_state(self):
@@ -60,83 +63,84 @@ class NotificationManager:
 
         COOLDOWN_SEC = 8 * 3600  # 8 小时冷却
 
-        # 每 8 小时最多一次合并推送
-        batch_key = "sabr_batch"
-        last_ts = last_push_ts(batch_key)
-        if time.time() - last_ts < COOLDOWN_SEC:
-            logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
-            return 0
+        async with self._push_lock:
+            # 每 8 小时最多一次合并推送（锁内判断，避免并发重复）
+            batch_key = "sabr_batch"
+            last_ts = last_push_ts(batch_key)
+            if time.time() - last_ts < COOLDOWN_SEC:
+                logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
+                return 0
 
-        # 筛选当天未推过的 high 信号（含进程内缓存防并发 + 跨周期模糊去重）
-        new_signals = []
-        for s in signals:
-            if s.get("confidence") != "high":
-                continue
-            key = f"sabr_{s.get('id', '')}"
-            # 进程内缓存检查（防竞争条件）
-            if key in self._pushed_this_run:
-                continue
-            c = push_count_today(key)
-            if c >= 1:
-                self._pushed_this_run.add(key)
-                continue
-            # 跨周期模糊去重：同策略+共享腿→和今天已推过的历史信号去重
-            s_legs = {l["instrument"] for l in s.get("legs", [])}
-            if has_conflicting_legs(s.get("strategy_type", ""), s_legs):
-                self._pushed_this_run.add(key)
-                logger.info(f"跨周期模糊去重: {s.get('strategy_type')} {s.get('currency')} {s.get('description','')[:50]}")
-                continue
-            new_signals.append(s)
-
-        # 模糊去重：同一到期日+同策略类型+至少一条腿重合→视为同信号，只保留第一个
-        deduped = []
-        for s in new_signals:
-            s_legs = {l["instrument"] for l in s.get("legs", [])}
-            dup = False
-            for existing in deduped:
-                e_legs = {l["instrument"] for l in existing.get("legs", [])}
-                # 同一策略类型 且 共享至少一条腿
-                if (s.get("strategy_type") == existing.get("strategy_type") and
-                    s_legs & e_legs):
-                    dup = True
-                    break
-            if not dup:
-                deduped.append(s)
-        if deduped and len(deduped) != len(new_signals):
-            logger.info(f"模糊去重: {len(new_signals)} → {len(deduped)} 条信号")
-        new_signals = deduped
-
-        if not new_signals:
-            return 0
-
-        # 发送前锁定：先标记进程内缓存（防止发送期间的竞争）
-        batch_keys = [f"sabr_{s.get('id', '')}" for s in new_signals]
-        for k in batch_keys:
-            self._pushed_this_run.add(k)
-
-        # 合并成一条消息推送
-        body = self._format_sabr_batch(new_signals)
-        ok = await self._dispatch(body, "[期权天眼] SABR 信号汇总")
-        if ok:
-            mark_pushed(batch_key)
-            for s in new_signals:
+            # 筛选当天未推过的 high 信号（含进程内缓存防并发 + 跨周期模糊去重）
+            new_signals = []
+            for s in signals:
+                if s.get("confidence") != "high":
+                    continue
                 key = f"sabr_{s.get('id', '')}"
-                mark_pushed(key)
-                legs = {l["instrument"] for l in s.get("legs", [])}
-                save_pushed_legs(s.get("strategy_type", ""), legs)
-                append_log({
-                    "ts": int(time.time()),
-                    "type": "sabr",
-                    "signal_id": s.get("id", ""),
-                    "currency": s.get("currency", ""),
-                    "strategy": s.get("strategy_type", ""),
-                    "direction": s.get("direction", ""),
-                    "description": s.get("description", "")[:80],
-                })
+                # 进程内缓存检查（防竞争条件）
+                if key in self._pushed_this_run:
+                    continue
+                c = push_count_today(key)
+                if c >= 1:
+                    self._pushed_this_run.add(key)
+                    continue
+                # 跨周期模糊去重：同策略+共享腿→和今天已推过的历史信号去重
+                s_legs = {l["instrument"] for l in s.get("legs", [])}
+                if has_conflicting_legs(s.get("strategy_type", ""), s_legs):
+                    self._pushed_this_run.add(key)
+                    logger.info(f"跨周期模糊去重: {s.get('strategy_type')} {s.get('currency')} {s.get('description','')[:50]}")
+                    continue
+                new_signals.append(s)
 
-        pushed = len(new_signals)
-        logger.info(f"SABR 合并推送完成: {pushed} 条新信号")
-        return pushed
+            # 模糊去重：同一到期日+同策略类型+至少一条腿重合→视为同信号，只保留第一个
+            deduped = []
+            for s in new_signals:
+                s_legs = {l["instrument"] for l in s.get("legs", [])}
+                dup = False
+                for existing in deduped:
+                    e_legs = {l["instrument"] for l in existing.get("legs", [])}
+                    # 同一策略类型 且 共享至少一条腿
+                    if (s.get("strategy_type") == existing.get("strategy_type") and
+                        s_legs & e_legs):
+                        dup = True
+                        break
+                if not dup:
+                    deduped.append(s)
+            if deduped and len(deduped) != len(new_signals):
+                logger.info(f"模糊去重: {len(new_signals)} → {len(deduped)} 条信号")
+            new_signals = deduped
+
+            if not new_signals:
+                return 0
+
+            # 发送前锁定进程内缓存（防止发送期间的竞争）
+            batch_keys = [f"sabr_{s.get('id', '')}" for s in new_signals]
+            for k in batch_keys:
+                self._pushed_this_run.add(k)
+
+            # 合并成一条消息推送
+            body = self._format_sabr_batch(new_signals)
+            ok = await self._dispatch(body, "[期权天眼] SABR 信号汇总")
+            if ok:
+                mark_pushed(batch_key)
+                for s in new_signals:
+                    key = f"sabr_{s.get('id', '')}"
+                    mark_pushed(key)
+                    legs = {l["instrument"] for l in s.get("legs", [])}
+                    save_pushed_legs(s.get("strategy_type", ""), legs)
+                    append_log({
+                        "ts": int(time.time()),
+                        "type": "sabr",
+                        "signal_id": s.get("id", ""),
+                        "currency": s.get("currency", ""),
+                        "strategy": s.get("strategy_type", ""),
+                        "direction": s.get("direction", ""),
+                        "description": s.get("description", "")[:80],
+                    })
+
+            pushed = len(new_signals)
+            logger.info(f"SABR 合并推送完成: {pushed} 条新信号")
+            return pushed
 
     def _format_sabr_batch(self, signals: list[dict]) -> str:
         """将所有信号合并为一条消息（保持与单条推送一致的样式的精简版）"""

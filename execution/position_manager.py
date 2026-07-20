@@ -19,9 +19,8 @@ class Position:
     def __init__(self, ex_data: dict, signal: Signal = None):
         """ex_data: private/get_positions 返回的单条持仓"""
         self.instrument = ex_data.get("instrument_name", "")
-        self.currency = ex_data.get("direction", "BTC").replace("option_", "")
-        if self.currency.startswith("option_"):
-            self.currency = self.currency.replace("option_", "")
+        # 币种字段是 currency（direction 是 buy/sell/zero，不是币种）
+        self.currency = ex_data.get("currency", "")
         if not self.currency or len(self.currency) > 5:
             parts = self.instrument.split("-")
             self.currency = parts[0] if len(parts) > 0 else "BTC"

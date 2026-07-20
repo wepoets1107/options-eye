@@ -143,10 +143,6 @@ class DeribitTrader:
             except Exception as e:
                 logger.warning(f"填充 {cur} 持仓缓存失败: {e}")
 
-    def get_cached_positions(self) -> list[dict]:
-        """获取缓存中的持仓列表（由 user.positions 推送实时更新）"""
-        return list(self._position_cache.values())
-
     async def get_order_state(self, order_id: str) -> dict:
         """查询订单状态"""
         await self._ensure_auth()

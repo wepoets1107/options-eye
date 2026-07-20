@@ -12,6 +12,7 @@ run_v*.log
 
 # 运行时状态（推送记录、信号日志等）
 data/pushed_signals.json
+data/pushed_legs.json
 data/notifications.jsonl
 
 # 本地配置（含本机设置，不提交；请用 config.example.yaml）
