@@ -35,17 +35,17 @@ class NotificationManager:
         规则：
         - 仅推送 confidence=high（三星）的信号
         - 所有当天未推过的信号合并为一条消息推送
-        - 全天最多推送 3 次合并消息（避免刷屏）
-        - 每次推送后标记所有已推信号为已推（signal_id 级别去重）
+        - 全天最多推送 1 次（发送后当天不再重复）
+        - 每次推送后标记所有已推信号（signal_id 级别去重）
         """
         if not self.enabled or not signals:
             return 0
 
-        # 当天合并推送计数器
+        # 当天已发过合并推送则跳过
         batch_key = "sabr_batch"
-        batch_cnt = push_count_today(batch_key)
-        if batch_cnt >= 3:
-            logger.info(f"SABR 合并推送当天已达上限 ({batch_cnt}/3)，跳过")
+        cnt = push_count_today(batch_key)
+        if cnt >= 1:
+            logger.info(f"SABR 当天已推送过合并消息，跳过")
             return 0
 
         # 筛选当天未推过的 high 信号
@@ -54,8 +54,8 @@ class NotificationManager:
             if s.get("confidence") != "high":
                 continue
             key = f"sabr_{s.get('id', '')}"
-            cnt = push_count_today(key)
-            if cnt >= 1:
+            c = push_count_today(key)
+            if c >= 1:
                 continue
             new_signals.append(s)
 
