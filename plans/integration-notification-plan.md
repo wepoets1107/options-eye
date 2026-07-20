@@ -162,10 +162,10 @@ notification:
     max_per_day: 2                 # 每日最大推送次数
 
   wechat:
-    enabled: true
+    enabled: false
     channel: "openclaw-weixin"
-    target: "o9cq804TZ1g7CbmoZyjvXOCi-qiA@im.wechat"
-    account: "8dbb069b7560-im-bot"
+    target: "<YOUR_WECHAT_TARGET>"
+    account: "<YOUR_WECHAT_ACCOUNT>"
 
   telegram:
     enabled: true
@@ -174,8 +174,8 @@ notification:
 
   email:
     enabled: true
-    from_addr: "binghuodao@agent.qq.com"
-    to_addr: "9006549@qq.com"
+    from_addr: "your@email.com"
+    to_addr: "recipient@email.com"
 ```
 
 ## 依赖
