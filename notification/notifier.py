@@ -9,7 +9,7 @@ import logging
 import time
 from typing import Optional
 
-from notification.store import push_count_today, mark_pushed, append_log
+from notification.store import push_count_today, last_push_ts, mark_pushed, append_log
 from notification.channels.email import send_email
 from notification.channels.telegram import send_telegram
 from notification.channels.wechat import send_wechat
@@ -34,18 +34,19 @@ class NotificationManager:
 
         规则：
         - 仅推送 confidence=high（三星）的信号
-        - 所有当天未推过的信号合并为一条消息推送
-        - 全天最多推送 1 次（发送后当天不再重复）
-        - 每次推送后标记所有已推信号（signal_id 级别去重）
+        - 同一信号（signal_id）每天只推 1 次
+        - 合并消息每 8 小时最多推送 1 次（COOLDOWN_HOURS）
         """
         if not self.enabled or not signals:
             return 0
 
-        # 当天已发过合并推送则跳过
+        COOLDOWN_SEC = 8 * 3600  # 8 小时冷却
+
+        # 每 8 小时最多一次合并推送
         batch_key = "sabr_batch"
-        cnt = push_count_today(batch_key)
-        if cnt >= 1:
-            logger.info(f"SABR 当天已推送过合并消息，跳过")
+        last_ts = last_push_ts(batch_key)
+        if time.time() - last_ts < COOLDOWN_SEC:
+            logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
             return 0
 
         # 筛选当天未推过的 high 信号

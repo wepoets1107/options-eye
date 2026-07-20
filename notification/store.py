@@ -65,6 +65,19 @@ def mark_pushed(key: str):
     logger.info(f"已标记推送: {full_key} (累计 {len(records)} 次)")
 
 
+def last_push_ts(key: str) -> float:
+    """某类信号最近一次推送的时间戳，0 表示从未推过"""
+    today = time.strftime("%Y-%m-%d")
+    full_key = f"{today}_{key}"
+    pushed = _load_pushed()
+    records = pushed.get(full_key, [])
+    if isinstance(records, list) and records:
+        return float(records[-1])
+    if isinstance(records, (int, float)):
+        return float(records)
+    return 0.0
+
+
 def append_log(entry: dict):
     """追加推送日志"""
     _ensure_dir()
