@@ -293,6 +293,19 @@ async function loadParams() {
 loadParams();
 
 // ---- 数据轮询 ----
+// 时间统一以 UTC+8（北京时间）展示，不依赖浏览器所在时区
+function fmtBJT(ts){
+  if(!ts) return '--';
+  var u = new Date(ts * 1000 + 8 * 3600 * 1000);
+  var Y = u.getUTCFullYear();
+  var M = String(u.getUTCMonth() + 1).padStart(2, '0');
+  var D = String(u.getUTCDate()).padStart(2, '0');
+  var h = String(u.getUTCHours()).padStart(2, '0');
+  var m = String(u.getUTCMinutes()).padStart(2, '0');
+  var s = String(u.getUTCSeconds()).padStart(2, '0');
+  return Y + '-' + M + '-' + D + ' ' + h + ':' + m + ':' + s;
+}
+
 async function fetchData() {
   try {
     var [stat, slices, devs, signals, expiry] = await Promise.all([
@@ -382,18 +395,6 @@ function renderExpiry(d) {
   function has(x){ return x !== undefined && x !== null && !Number.isNaN(Number(x)); }
   function pct(x){ return has(x) ? (x*100).toFixed(1)+'%' : '--'; }
   function num(x, dec){ dec = dec || 0; return has(x) ? Number(x).toLocaleString(undefined, {maximumFractionDigits: dec}) : '--'; }
-  // 时间统一以 UTC+8（北京时间）展示，不依赖浏览器所在时区
-  function fmtBJT(ts){
-    if(!ts) return '--';
-    var u = new Date(ts * 1000 + 8 * 3600 * 1000);
-    var Y = u.getUTCFullYear();
-    var M = String(u.getUTCMonth() + 1).padStart(2, '0');
-    var D = String(u.getUTCDate()).padStart(2, '0');
-    var h = String(u.getUTCHours()).padStart(2, '0');
-    var m = String(u.getUTCMinutes()).padStart(2, '0');
-    var s = String(u.getUTCSeconds()).padStart(2, '0');
-    return Y + '-' + M + '-' + D + ' ' + h + ':' + m + ':' + s;
-  }
   function signed(x){ return has(x) ? ((x>=0?'+':'') + (x*100).toFixed(2) + '%') : '--'; }
   function bar(label, v, color){
     var ok = has(v);
