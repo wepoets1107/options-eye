@@ -29,6 +29,9 @@ class NotificationManager:
         self.tg_cfg = self.cfg.get("telegram", {})
         self.wx_cfg = self.cfg.get("wechat", {})
 
+        # 进程内去重缓存（防止 read-check-write 竞争条件导致重复推送）
+        self._pushed_this_run: set = set()
+
     async def push_sabr_signals(self, signals: list[dict]) -> int:
         """推送 SABR 策略信号
 
@@ -49,14 +52,18 @@ class NotificationManager:
             logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
             return 0
 
-        # 筛选当天未推过的 high 信号
+        # 筛选当天未推过的 high 信号（含进程内缓存防并发）
         new_signals = []
         for s in signals:
             if s.get("confidence") != "high":
                 continue
             key = f"sabr_{s.get('id', '')}"
+            # 进程内缓存检查（防竞争条件）
+            if key in self._pushed_this_run:
+                continue
             c = push_count_today(key)
             if c >= 1:
+                self._pushed_this_run.add(key)
                 continue
             new_signals.append(s)
 
@@ -80,6 +87,11 @@ class NotificationManager:
 
         if not new_signals:
             return 0
+
+        # 发送前锁定：先标记进程内缓存（防止发送期间的竞争）
+        batch_keys = [f"sabr_{s.get('id', '')}" for s in new_signals]
+        for k in batch_keys:
+            self._pushed_this_run.add(k)
 
         # 合并成一条消息推送
         body = self._format_sabr_batch(new_signals)
