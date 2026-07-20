@@ -5,7 +5,8 @@
 - 全推送、零轮询。期权链 IV 曲面 + Greeks 统一由 `ticker.{instrument}.{interval}`
   订阅频道推送（该频道自带 mark_iv / bid_iv / ask_iv / greeks / mark_price /
   open_interest，一个订阅替代原先的两处轮询）。
-- Deribit 限制每连接最多 200 个订阅，故用多连接池分摊（每连接 ≤180）。
+- Deribit 限制每连接最多 200 个订阅，并发连接数过多会触发服务端限流。
+  因此限制最多 3 个连接（3×200=600 频道），优先覆盖主力合约。
 - 仅「获取合约列表」「指数价兜底」等极少数控制请求走主连接按需发送；
   运行期不轮询任何行情接口，避免触发限流/封禁。
 - book.{currency}.summary 推送频道经实测不推送数据，故不作为数据源。
@@ -20,8 +21,12 @@ import websockets
 
 logger = logging.getLogger(__name__)
 
-# 每连接最大订阅数（Deribit 硬上限 200，留余量）
-MAX_SUBS_PER_CONN = 180
+# 每连接最大订阅数（Deribit 硬上限 200，不留余量）
+MAX_SUBS_PER_CONN = 200
+# 只使用 1 个连接，分批轮转采集（任何时候只订阅 1 批）
+MAX_TICKER_CONNS = 1
+# 每批采集时长（秒）
+BATCH_DWELL_SEC = 30
 # ticker 推送间隔：Deribit 公共连接实测仅 100ms（及 raw 需认证）真正推送；
 # 1s / 5s / 1m 在公共 API 上均不推送，故默认 100ms。
 # illiquid 期权仅在变化时才推送，真实流量远小于频道数。
@@ -70,6 +75,10 @@ class DeribitWS:
 
         # 已知期权合约列表（用于管理订阅）
         self.instruments: list[str] = []
+
+        # 分批轮转采集
+        self._all_ticker_channels: list[str] = []  # 所有合约频道
+        self._ticker_batch_idx: int = 0            # 当前批次索引
 
         self.on_chain_update = None  # 预留回调（当前主循环按周期读缓存，未使用）
 
@@ -213,24 +222,57 @@ class DeribitWS:
 
     # ============ ticker 订阅连接池 ============
     async def manage_ticker_subscriptions(self, instruments: list[str]):
-        """按合约列表重建/增量更新 ticker 订阅（分摊到多连接，≤180/连接）"""
+        """单连接 + 分批轮转：任何时候只订阅 1 批（≤200 频道），每批停留 BATCH_DWELL_SEC 秒后切到下一批"""
         target = [f"ticker.{i}.{self.ticker_interval}" for i in instruments]
-        n_conn = max(1, (len(target) + MAX_SUBS_PER_CONN - 1) // MAX_SUBS_PER_CONN)
+        self._all_ticker_channels = target
+        total = len(target)
+        n_batch = max(1, (total + MAX_SUBS_PER_CONN - 1) // MAX_SUBS_PER_CONN)
+        logger.info(f"全量合约 {total} 个，分 {n_batch} 批采集（每批 ≤{MAX_SUBS_PER_CONN}，每批 {BATCH_DWELL_SEC}s）")
 
-        # 按需扩容连接
-        while len(self.ticker_conns) < n_conn:
+        # 确保有且仅有 1 个连接
+        while len(self.ticker_conns) > MAX_TICKER_CONNS:
+            extra = self.ticker_conns.pop()
+            extra.running = False
+            if extra.ws:
+                asyncio.create_task(extra.ws.close())
+        while len(self.ticker_conns) < MAX_TICKER_CONNS:
             conn = _TickerConn(self.url, len(self.ticker_conns), self.ticker_cache, self._on_ticker)
             self.ticker_conns.append(conn)
             asyncio.create_task(self._ticker_connect(conn))
             await asyncio.sleep(0.2)
 
-        # round-robin 把频道均分到各连接
-        new_assign = [[] for _ in range(n_conn)]
-        for i, ch in enumerate(target):
-            new_assign[i % n_conn].append(ch)
+        # 订阅第一批，启动轮转
+        self._ticker_batch_idx = 0
+        await self._switch_ticker_batch(0)
+        asyncio.create_task(self._ticker_rotation_loop())
 
-        for conn, chs in zip(self.ticker_conns, new_assign):
-            await self._sync_conn(conn, chs)
+    async def _switch_ticker_batch(self, batch_idx: int):
+        """切换到指定批次"""
+        total = len(self._all_ticker_channels)
+        if total == 0:
+            return
+        start = batch_idx * MAX_SUBS_PER_CONN
+        end = min(start + MAX_SUBS_PER_CONN, total)
+        batch = self._all_ticker_channels[start:end]
+        n_batch = max(1, (total + MAX_SUBS_PER_CONN - 1) // MAX_SUBS_PER_CONN)
+        logger.info(f"切换 ticker 批次 {batch_idx + 1}/{n_batch}（{start}~{end}，共 {len(batch)} 频道）")
+        conn = self.ticker_conns[0]
+        await self._sync_conn(conn, batch)
+
+    async def _ticker_rotation_loop(self):
+        """后台轮转：每 BATCH_DWELL_SEC 切换到下一批"""
+        try:
+            while True:
+                await asyncio.sleep(BATCH_DWELL_SEC)
+                total = len(self._all_ticker_channels)
+                if total == 0:
+                    continue
+                n_batch = max(1, (total + MAX_SUBS_PER_CONN - 1) // MAX_SUBS_PER_CONN)
+                self._ticker_batch_idx = (self._ticker_batch_idx + 1) % n_batch
+                await self._switch_ticker_batch(self._ticker_batch_idx)
+        except Exception as e:
+            logger.warning(f"ticker 轮转循环异常: {e}")
+            # 不退出，由看门狗兜底
 
     async def _sync_conn(self, conn: _TickerConn, target_channels: list[str]):
         """对单个连接做 订阅/退订 diff"""

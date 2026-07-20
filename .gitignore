@@ -6,7 +6,7 @@ env/
 # 运行日志 / 临时探测脚本
 logs/
 *.log
-_*body_*.txt
+._*body_*.txt
 _probe_*.py
 run_v*.log
 
