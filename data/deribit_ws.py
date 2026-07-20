@@ -25,8 +25,8 @@ logger = logging.getLogger(__name__)
 MAX_SUBS_PER_CONN = 200
 # 只使用 1 个连接，分批轮转采集（任何时候只订阅 1 批）
 MAX_TICKER_CONNS = 1
-# 每批采集时长（秒）
-BATCH_DWELL_SEC = 30
+# 每批采集时长（秒）：30秒太短导致频繁subscribe被限流，改为3分钟
+BATCH_DWELL_SEC = 180
 # ticker 推送间隔：Deribit 公共连接实测仅 100ms（及 raw 需认证）真正推送；
 # 1s / 5s / 1m 在公共 API 上均不推送，故默认 100ms。
 # illiquid 期权仅在变化时才推送，真实流量远小于频道数。
@@ -282,6 +282,7 @@ class DeribitWS:
         if to_del:
             try:
                 await self._tconn_send(conn, "public/unsubscribe", {"channels": to_del})
+                await asyncio.sleep(0.5)  # 退订后等一会再订阅，减少限流风险
             except Exception as e:
                 logger.warning(f"ticker#{conn.idx} unsubscribe 失败: {e}")
             conn.subscribed -= set(to_del)
@@ -292,18 +293,29 @@ class DeribitWS:
                 logger.info(f"ticker 连接#{conn.idx} 当前订阅 {len(conn.subscribed)} 频道")
             except Exception as e:
                 logger.warning(f"ticker#{conn.idx} subscribe 失败: {e}")
+                # subscribe 失败后仍然更新 subscribed 为目标集，防止死循环重试
+                conn.subscribed = target_set.copy()
 
-    async def _ticker_connect(self, conn: _TickerConn):
+    async def _ticker_connect(self, conn: _TickerConn, retry_count: int = 0):
         try:
             conn.ws = await websockets.connect(self.url, ping_interval=30)
             conn.running = True
             logger.info(f"ticker 连接#{conn.idx} 已建立")
             await self._ticker_recv_loop(conn)
+        except websockets.ConnectionClosed as e:
+            if "over_limit" in str(e):
+                wait = min(60 * (retry_count + 1), 300)
+                logger.warning(f"ticker#{conn.idx} 被限流(over_limit)，等待 {wait}s 后重连")
+                await asyncio.sleep(wait)
+            else:
+                await asyncio.sleep(3)
+            conn.running = False
+            asyncio.create_task(self._ticker_connect(conn, retry_count + 1))
         except Exception as e:
             logger.error(f"ticker 连接#{conn.idx} 错误: {e}")
             conn.running = False
             await asyncio.sleep(3)
-            asyncio.create_task(self._ticker_connect(conn))
+            asyncio.create_task(self._ticker_connect(conn, retry_count + 1))
 
     async def _ticker_recv_loop(self, conn: _TickerConn):
         try:

@@ -112,7 +112,7 @@ class NotificationManager:
                 })
 
         pushed = len(new_signals)
-        logger.info(f"SABR 合并推送完成: 批次#{batch_cnt + 1}/3, {pushed} 条新信号")
+        logger.info(f"SABR 合并推送完成: {pushed} 条新信号")
         return pushed
 
     def _format_sabr_batch(self, signals: list[dict]) -> str:
