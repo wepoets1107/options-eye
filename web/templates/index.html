@@ -318,7 +318,7 @@ async function fetchData() {
     }
 
     document.getElementById('header-time').textContent =
-      stat.last_update ? new Date(stat.last_update * 1000).toLocaleTimeString() : '--';
+      fmtBJT(stat.last_update);
 
     // BTC 价按币种定位
     if (slices.slices && slices.slices.length > 0) {
@@ -382,6 +382,18 @@ function renderExpiry(d) {
   function has(x){ return x !== undefined && x !== null && !Number.isNaN(Number(x)); }
   function pct(x){ return has(x) ? (x*100).toFixed(1)+'%' : '--'; }
   function num(x, dec){ dec = dec || 0; return has(x) ? Number(x).toLocaleString(undefined, {maximumFractionDigits: dec}) : '--'; }
+  // 时间统一以 UTC+8（北京时间）展示，不依赖浏览器所在时区
+  function fmtBJT(ts){
+    if(!ts) return '--';
+    var u = new Date(ts * 1000 + 8 * 3600 * 1000);
+    var Y = u.getUTCFullYear();
+    var M = String(u.getUTCMonth() + 1).padStart(2, '0');
+    var D = String(u.getUTCDate()).padStart(2, '0');
+    var h = String(u.getUTCHours()).padStart(2, '0');
+    var m = String(u.getUTCMinutes()).padStart(2, '0');
+    var s = String(u.getUTCSeconds()).padStart(2, '0');
+    return Y + '-' + M + '-' + D + ' ' + h + ':' + m + ':' + s;
+  }
   function signed(x){ return has(x) ? ((x>=0?'+':'') + (x*100).toFixed(2) + '%') : '--'; }
   function bar(label, v, color){
     var ok = has(v);
@@ -751,7 +763,7 @@ async function refreshPositions() {
         var p = legs[0];
         var totalPnl = legs.reduce(function(s, x) { return s + (x.unrealized_pnl || 0); }, 0);
         var totalDelta = legs.reduce(function(s, x) { return s + (x.delta || 0); }, 0);
-        var dt = new Date(p.executed_at * 1000).toLocaleString();
+        var dt = fmtBJT(p.executed_at);
         html += '<div class="pos-card">';
         html += '  <div class="top"><div class="ttl">' + (p.direction === 'short' ? '做空' : '做多') + ' ' + p.strategy_type + ' | ' + p.currency + '</div>';
         html += '    <div class="pnl-big" style="color:' + pnlColor(totalPnl) + ';">' + (totalPnl > 0 ? '+' : '') + totalPnl.toFixed(5) + '</div></div>';
@@ -775,7 +787,7 @@ async function refreshPositions() {
       } else {
         // 独立持仓（无 signal_id 或单腿）
         legs.forEach(function(p) {
-          var dt = new Date(p.executed_at * 1000).toLocaleString();
+          var dt = fmtBJT(p.executed_at);
           var pnl = p.unrealized_pnl || 0;
           html += '<div class="pos-card">';
           html += '  <div class="top"><div class="ttl">' + (p.size > 0 ? '买' : '卖') + ' ' + Math.abs(p.size).toFixed(1) + 'x ' + p.instrument + '</div>';
@@ -869,7 +881,7 @@ async function glStatus() {
     var tgt = p.coinTargetDelta != null ? p.coinTargetDelta : 0;
     var tgtTxt = tgt == 0 ? '中性 (0)' : (tgt > 0 ? '+'+tgt : tgt);
     var startTime = p.start_time || d.start_time;
-    var stTxt = startTime ? new Date(startTime * 1000).toLocaleString() : '—';
+    var stTxt = startTime ? fmtBJT(startTime) : '—';
     var fut = p.longFuture || p.shortFuture || '—';
     var otype = p.orderType || 'taker';
     var each = otype === 'maker' ? (p.makerEachOrderSize || '—') : (p.takerEachOrderSize || '—');

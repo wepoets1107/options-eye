@@ -9,7 +9,7 @@ import logging
 import math
 import statistics
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Optional
 from collections import deque
@@ -18,7 +18,7 @@ from notification.bnb_client import RollingMarket, ema, safe_float, now_ms
 
 logger = logging.getLogger(__name__)
 
-SH_TZ = timezone.utc  # 简化，不影响评分逻辑
+SH_TZ = timezone(timedelta(hours=8))  # 展示用 UTC+8（北京时间），不影响评分逻辑
 
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 

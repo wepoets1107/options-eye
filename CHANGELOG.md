@@ -1,5 +1,14 @@
 # 期权天眼 更新日志
 
+## 0.13.0 (2026-07-20) 展示时间统一 UTC+8
+
+所有面向用户的时间展示统一为北京时间（UTC+8），不再依赖浏览器/机器时区。
+
+### 修改
+- `notification/expiry_scorer.py`：`fmt_ts()` 的时区常量由 UTC 改为 UTC+8（`updated_at` 字段现在显示北京时间）。
+- `web/templates/index.html`：新增 `fmtBJT()`，将头部更新时间、持仓成交时间、服务启动时间由 `toLocaleString`（随浏览器时区）改为显式 UTC+8 格式化。
+- 内部 UTC 计算（Deribit 到期日比较、SABR 剩余时间等）保持不变。
+
 ## 0.12.0 (2026-07-20) 控制连接重连根治 + 末日期权 REST 兜底
 
 修复末日期权评分因 Deribit 控制连接断开而永久冻结的故障。
