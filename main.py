@@ -255,6 +255,8 @@ async def expiry_eval_loop(web_state: dict):
             try:
                 raw = await ws.get_book_summary_by_currency("BTC")
                 raw_list = raw if isinstance(raw, list) else []
+                if not raw_list:
+                    raise ValueError("book_summary 为空")
                 # book_summary 本身不带 greeks；用 ticker 推送缓存里的真实 greeks 补齐，
                 # 让末日期权评分的 _choose_option 能按 delta 选合约（否则走 moneyness 兜底）
                 for o in raw_list:
@@ -266,7 +268,24 @@ async def expiry_eval_loop(web_state: dict):
                     opts.append(o)
                 logger.info(f"末日期权: {len(opts)} 合约, 指数={idx:.0f}")
             except Exception as e:
-                logger.warning(f"末日期权拉取 Deribit 失败: {e}")
+                logger.warning(f"末日期权拉取 Deribit(WS)失败: {e}，尝试 REST 兜底")
+                # REST 兜底：控制连接断开时也能继续评估（不依赖 WS 控制连接）
+                try:
+                    import json as _json
+                    import urllib.request as _req
+                    _url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC"
+                    _resp = _req.urlopen(_url, timeout=10)
+                    raw_list = _json.loads(_resp.read()).get("result", [])
+                    for o in raw_list:
+                        name = o.get("instrument_name")
+                        c = ws.ticker_cache.get(name)
+                        g = c.get("greeks", {}) if c else {}
+                        o = dict(o)
+                        o["greeks"] = g
+                        opts.append(o)
+                    logger.info(f"末日期权(REST兜底): {len(opts)} 合约, 指数={idx:.0f}")
+                except Exception as e2:
+                    logger.warning(f"末日期权 REST 兜底也失败: {e2}")
 
             if idx and opts:
                 scorer.update_deribit(idx, opts)

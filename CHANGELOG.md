@@ -1,5 +1,20 @@
 # 期权天眼 更新日志
 
+## 0.12.0 (2026-07-20) 控制连接重连根治 + 末日期权 REST 兜底
+
+修复末日期权评分因 Deribit 控制连接断开而永久冻结的故障。
+
+### 修复
+- `data/deribit_ws.py`：控制连接重连从「recv 协程内递归重启」改为独立 `_supervisor` 协程管理。
+  - `_connect_main` 重连前先 cancel 旧 recv 协程，杜绝并发 recv（websockets 报
+    "cannot call recv while another coroutine is already running" 导致连上即断的死循环）。
+  - `_control_recv_loop` 改为单次生命周期，断开后由 `_supervisor` 负责重连，不再自重启。
+  - `_supervisor` 无限重试（去掉原 10 次硬上限），指数退避；识别 HTTP 429 限流时退避 60→120→240→300s，
+    普通失败 5→10→20→40→80→120s 封顶。
+  - `disconnect` 置 `_shutdown` 并取消 supervisor/recv 协程，避免关闭后继续重连。
+- `main.py`：`expiry_eval_loop` 拉合约时，WS 控制连接异常或返回空，自动用 Deribit REST
+  `get_book_summary_by_currency?currency=BTC` 兜底，末日期权评估不再依赖控制连接。
+
 ## 0.11.0 (2026-07-20) 末日期权买方信号前端模块
 
 前端新增「末日期权买方信号」模块（位于策略信号下方），实时展示评分，不再只等触发才推电报。

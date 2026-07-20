@@ -62,6 +62,10 @@ class DeribitWS:
         self._pending: dict = {}
         self._lock = asyncio.Lock()
         self._running = False
+        self._recv_task = None            # 控制连接 recv 协程引用
+        self._supervisor_task = None      # 监督重连协程引用
+        self._shutdown = False            # 关闭标志（disconnect 时置位）
+        self._reconn_attempt = 0          # 重连尝试计数（用于退避）
 
         # 指数价格（deribit_price_index.{btc_usd,eth_usd} 推送）
         self.index_price: dict[str, float] = {}
@@ -89,6 +93,7 @@ class DeribitWS:
     async def connect(self):
         """建链 + 初始化全部订阅（一次性，运行期不再轮询）"""
         await self._connect_main()
+        self._supervisor_task = asyncio.create_task(self._supervisor())
         asyncio.create_task(self._watchdog())
         # 拉合约列表 -> 建立 ticker 订阅（全推送起点）
         await self._init_chain()
@@ -102,48 +107,65 @@ class DeribitWS:
             logger.warning(f"冷启动 book summary 失败（将等待 ticker 推送）: {e}")
 
     async def _connect_main(self):
+        # 取消可能残留的旧 recv 协程，杜绝并发 recv
+        # websockets 不允许同一连接被多个协程同时 recv，否则会报
+        # "cannot call recv while another coroutine is already running" 并立即断开
+        old = self._recv_task
+        if old is not None and not old.done():
+            old.cancel()
+            try:
+                await old
+            except (asyncio.CancelledError, Exception):
+                pass
         self.ws = await websockets.connect(self.url, ping_interval=30)
         self._running = True
+        self._recv_task = asyncio.create_task(self._control_recv_loop())
         logger.info("Deribit 控制连接已建立")
-        asyncio.create_task(self._control_recv_loop())
 
     async def _control_recv_loop(self):
-        while True:
-            try:
-                async for msg in self.ws:
-                    data = json.loads(msg)
-                    await self._handle_control(data)
-            except Exception as e:
-                logger.error(f"控制连接 recv 错误: {e}")
-                self._running = False
-                # 清理悬空的 pending futures（连接断线后永远不会收到响应）
-                for rid, fut in list(self._pending.items()):
-                    if not fut.done():
-                        fut.set_exception(ConnectionError("控制连接已断开"))
-                    self._pending.pop(rid, None)
-                await asyncio.sleep(3)
-                await self._reconnect_main()
-
-    async def _reconnect_main(self):
-        logger.info("控制连接重连中...")
-        for attempt in range(10):
-            try:
-                await self._connect_main()
-                await self.subscribe_index()
-                return
-            except Exception as e:
-                logger.error(f"控制重连第{attempt+1}次失败: {e}")
-                await asyncio.sleep(min(5 * (attempt + 1), 30))
-        logger.error("控制连接重连已达到最大尝试次数")
-        # 最后一次尝试：重新创建整个ws对象
         try:
-            self.ws = await websockets.connect(self.url, ping_interval=30)
-            self._running = True
-            asyncio.create_task(self._control_recv_loop())
-            await self.subscribe_index()
-            logger.info("控制连接最终重连成功")
+            async for msg in self.ws:
+                data = json.loads(msg)
+                await self._handle_control(data)
+        except asyncio.CancelledError:
+            return  # 被重连逻辑取消，正常退出
         except Exception as e:
-            logger.error(f"控制连接最终重连也失败: {e}")
+            logger.error(f"控制连接 recv 错误: {e}")
+        finally:
+            self._running = False
+            # 清理悬空的 pending futures（连接断线后永远不会收到响应）
+            for rid, fut in list(self._pending.items()):
+                if not fut.done():
+                    fut.set_exception(ConnectionError("控制连接已断开"))
+                self._pending.pop(rid, None)
+        # 注意：不在此处自重启，由 _supervisor 协程负责重连
+
+    async def _supervisor(self):
+        """监督控制连接 recv 协程：断开后无限重连。
+
+        - 去掉原 10 次硬上限，改为无限重试直到恢复
+        - 指数退避：普通失败 5→10→20→40→80→120s 封顶；
+          HTTP 429 限流 60→120→240→300s 封顶（Deribit 对握手频率限流）
+        """
+        while not self._shutdown:
+            if self._recv_task is None or self._recv_task.done():
+                try:
+                    await self._connect_main()
+                    await self.subscribe_index()
+                    logger.info("控制连接重连成功")
+                    self._reconn_attempt = 0
+                except Exception as e:
+                    self._reconn_attempt += 1
+                    attempt = self._reconn_attempt
+                    is_429 = "429" in str(e) or "Too Many" in str(e)
+                    if is_429:
+                        wait = min(60 * (2 ** min(attempt, 3)), 300)
+                    else:
+                        wait = min(5 * (2 ** min(attempt, 5)), 120)
+                    logger.error(f"控制重连第{attempt}次失败，{wait}s 后重试: {e}")
+                    await asyncio.sleep(wait)
+                    continue
+            await asyncio.sleep(2)
 
     async def _handle_control(self, data: dict):
         # 请求响应
@@ -187,6 +209,11 @@ class DeribitWS:
         return res.get("result", {})
 
     async def disconnect(self):
+        self._shutdown = True
+        if self._supervisor_task is not None:
+            self._supervisor_task.cancel()
+        if self._recv_task is not None and not self._recv_task.done():
+            self._recv_task.cancel()
         self._running = False
         if self.ws:
             await self.ws.close()
