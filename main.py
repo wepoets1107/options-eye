@@ -248,10 +248,14 @@ async def expiry_eval_loop(web_state: dict):
 
             if idx and opts:
                 scorer.update_deribit(idx, opts)
+                m = scorer.market
+                logger.info(f"末日期权评估: idx={idx:.0f} K线={len(m.closes)} 成交={len(m.trades)}")
                 sig = scorer.evaluate()
                 if sig:
                     logger.info(f"末日期权信号: {sig['signal']} conf={sig['confidence']}")
                     asyncio.create_task(notif.push_expiry_signal(sig))
+                else:
+                    pass  # 数据不足或未触发
         except Exception as e:
             logger.warning(f"末日期权评分异常: {e}")
         await asyncio.sleep(15)  # 每15秒评估一次
@@ -264,6 +268,8 @@ async def main():
     logger.info("=" * 50)
     logger.info("期权天眼 启动")
     logger.info("=" * 50)
+    # 注意：data/pushed_signals.json 保存推送冷却记录，不要删除
+    # 删除会导致 restart 后重复推送历史信号
 
     deribit_cfg = config.get("deribit", {})
     public_ws = deribit_cfg.get("public_ws", "wss://www.deribit.com/ws/api/v2")
