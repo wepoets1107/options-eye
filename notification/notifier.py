@@ -60,6 +60,24 @@ class NotificationManager:
                 continue
             new_signals.append(s)
 
+        # 模糊去重：同一到期日+同策略类型+至少一条腿重合→视为同信号，只保留第一个
+        deduped = []
+        for s in new_signals:
+            s_legs = {l["instrument"] for l in s.get("legs", [])}
+            dup = False
+            for existing in deduped:
+                e_legs = {l["instrument"] for l in existing.get("legs", [])}
+                # 同一策略类型 且 共享至少一条腿
+                if (s.get("strategy_type") == existing.get("strategy_type") and
+                    s_legs & e_legs):
+                    dup = True
+                    break
+            if not dup:
+                deduped.append(s)
+        if deduped and len(deduped) != len(new_signals):
+            logger.info(f"模糊去重: {len(new_signals)} → {len(deduped)} 条信号")
+        new_signals = deduped
+
         if not new_signals:
             return 0
 
