@@ -1,5 +1,22 @@
 # 期权天眼 更新日志
 
+## 0.15.0 (2026-07-20) 交叉检查 bug 修复（连接健壮性 + 末日期权评估容错）
+
+对上一轮修改做代码交叉检查，修复 8 个 bug（P0~P2），提升连接自愈与评估容错。
+
+### 修复
+- `data/deribit_ws.py`：
+  - **看门狗协程泄漏（P1）**：`connect()` 中 `asyncio.create_task(self._watchdog())` 未保存引用、`while True` 无退出、`disconnect` 不取消。现保存 `_watchdog_task`，循环加 `not self._shutdown` 退出判断，`disconnect` 中一并 cancel。
+  - **重连后指数订阅永久丢失（P1）**：`_supervisor` 中 `subscribe_index` 失败且 recv 仍存活时会被卡在 sleep 分支、指数订阅再也不会恢复。现由 `_index_subscribed` 标志独立重试订阅（连接健康但订阅未完成时持续重试，不依赖 recv 断开）。
+  - **429 限流判定漏匹配（P2）**：`_supervisor` 原仅用 `"429" in str(e)` 判限流，可能漏掉 websockets `InvalidStatusCode`。现同时检查 `e.status == 429`。
+  - **ticker 退避重置（P2）**：`_ticker_recv_loop` 重连不传 `retry_count`，导致 `over_limit` 退避从 0 重算。现 `_TickerConn` 记录 `retry_count`，recv 循环重连时续传。
+- `main.py`：
+  - **REST 兜底阻塞事件循环（P0）**：末日期权指数价与 `book_summary` 的 REST 兜底原用同步 `urllib.request.urlopen`，控制连接断开时每轮阻塞数秒~十几秒、卡住整条事件循环。现统一改用 `asyncio.to_thread` 包装的非阻塞 `_rest_get_json`，并同步用于 Binance 历史回填。
+  - **循环内重复 import（P2）**：去掉循环内 `import json, urllib.request`，提到文件顶部。
+  - **数据源不可用快照冻结（P2）**：`expiry_eval_loop` 中 `idx`/`opts` 都为空时 `last_scores` 不更新，前端长期显示陈旧快照。现新增 `data_unavailable` 状态，明确暴露「WS+REST 均失败」。
+- `notification/expiry_scorer.py`：
+  - **主计算段异常冻结快照（P1）**：`evaluate()` 主计算段（方向/资金流/选合约/双买评分 + 落盘）原无 try/except，脏数据会导致异常上抛、快照冻结且无提示。现包裹该段，异常时写 `last_scores` 为 `error` 状态并 `return None`，前端可立即看出评估失败。
+
 ## 0.14.0 (2026-07-20) 修复前端页面数据空白
 
 `index.html` 中 `fmtBJT()` 时间格式化函数被误放在 `renderExpiry` 内部（局部作用域），导致全局 `fetchData` 调用时报 `fmtBJT is not defined`，整页数据渲染中断、页面全空白。已将 `fmtBJT` 提升到全局作用域修复。

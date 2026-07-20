@@ -499,69 +499,84 @@ class ExpiryScorer:
             }
             return None
 
-        call, put = self._score_direction()
-        flow = self._option_flow_score(same_day)
+        try:
+            call, put = self._score_direction()
+            flow = self._option_flow_score(same_day)
 
-        # 期权盘口加分
-        if flow["pcr"] < 0.75:
-            call["score"] += 10
-            call["reasons"].append(f"PCR偏低 {flow['pcr']:.2f}")
-        if flow["pcr"] > 1.25 and flow["pcr"] < 9:
-            put["score"] += 10
-            put["reasons"].append(f"PCR偏高 {flow['pcr']:.2f}")
-        if flow["call_avg_iv"] > flow["put_avg_iv"] * 1.03 and flow["call_avg_iv"] > 0:
-            call["score"] += 8
-            call["reasons"].append("Call IV相对抬升")
-        if flow["put_avg_iv"] > flow["call_avg_iv"] * 1.03 and flow["put_avg_iv"] > 0:
-            put["score"] += 8
-            put["reasons"].append("Put IV相对抬升")
+            # 期权盘口加分
+            if flow["pcr"] < 0.75:
+                call["score"] += 10
+                call["reasons"].append(f"PCR偏低 {flow['pcr']:.2f}")
+            if flow["pcr"] > 1.25 and flow["pcr"] < 9:
+                put["score"] += 10
+                put["reasons"].append(f"PCR偏高 {flow['pcr']:.2f}")
+            if flow["call_avg_iv"] > flow["put_avg_iv"] * 1.03 and flow["call_avg_iv"] > 0:
+                call["score"] += 8
+                call["reasons"].append("Call IV相对抬升")
+            if flow["put_avg_iv"] > flow["call_avg_iv"] * 1.03 and flow["put_avg_iv"] > 0:
+                put["score"] += 8
+                put["reasons"].append("Put IV相对抬升")
 
-        # 选合约
-        call_opt = self._choose_option("C")
-        put_opt = self._choose_option("P")
-        atm_pair = self._choose_atm_pair(strict=False)
-        self._atm_call, self._atm_put = atm_pair if atm_pair else (None, None)
+            # 选合约
+            call_opt = self._choose_option("C")
+            put_opt = self._choose_option("P")
+            atm_pair = self._choose_atm_pair(strict=False)
+            self._atm_call, self._atm_put = atm_pair if atm_pair else (None, None)
 
-        if call_opt:
-            call["score"] += 10
-            call["reasons"].append(f"Call成本合格 {call_opt['instrument_name']}")
-        if put_opt:
-            put["score"] += 10
-            put["reasons"].append(f"Put成本合格 {put_opt['instrument_name']}")
+            if call_opt:
+                call["score"] += 10
+                call["reasons"].append(f"Call成本合格 {call_opt['instrument_name']}")
+            if put_opt:
+                put["score"] += 10
+                put["reasons"].append(f"Put成本合格 {put_opt['instrument_name']}")
 
-        pair = self._choose_atm_pair(strict=True)
-        straddle = self._score_straddle(call["score"], put["score"], flow, pair)
+            pair = self._choose_atm_pair(strict=True)
+            straddle = self._score_straddle(call["score"], put["score"], flow, pair)
 
-        call_final = max(0, min(100, call["score"]))
-        put_final = max(0, min(100, put["score"]))
-        straddle_final = max(0, min(100, straddle["score"]))
+            call_final = max(0, min(100, call["score"]))
+            put_final = max(0, min(100, put["score"]))
+            straddle_final = max(0, min(100, straddle["score"]))
 
-        # 持续落盘：无论是否触发信号，都把本轮评分写入 self.last_scores 供前端读取
-        self.last_scores = {
-            "status": "running",
-            "updated_at": fmt_ts(),
-            "updated_ts": time.time(),
-            "price": call["metrics"].get("price", 0),
-            "vwap": call["metrics"].get("vwap", 0),
-            "r5": call["metrics"].get("r5", 0),
-            "r15": call["metrics"].get("r15", 0),
-            "vol_ratio": call["metrics"].get("vol_ratio", 0),
-            "taker_buy_ratio": call["metrics"].get("taker_buy_ratio", 0),
-            "minutes_left": mins_left,
-            "call_score": call_final,
-            "put_score": put_final,
-            "straddle_score": straddle_final,
-            "pcr": flow.get("pcr"),
-            "atm_iv": flow.get("atm_iv"),
-            "same_day_options": len(same_day),
-            "straddle_blocked": straddle.get("blocked"),
-            "straddle_blockers": straddle.get("blockers", [])[:3],
-            "call_reasons": call["reasons"],
-            "put_reasons": put["reasons"],
-            "straddle_reasons": straddle["reasons"],
-            "last_signal": "NO_TRADE",
-            "last_reasons": [],
-        }
+            # 持续落盘：无论是否触发信号，都把本轮评分写入 self.last_scores 供前端读取
+            self.last_scores = {
+                "status": "running",
+                "updated_at": fmt_ts(),
+                "updated_ts": time.time(),
+                "price": call["metrics"].get("price", 0),
+                "vwap": call["metrics"].get("vwap", 0),
+                "r5": call["metrics"].get("r5", 0),
+                "r15": call["metrics"].get("r15", 0),
+                "vol_ratio": call["metrics"].get("vol_ratio", 0),
+                "taker_buy_ratio": call["metrics"].get("taker_buy_ratio", 0),
+                "minutes_left": mins_left,
+                "call_score": call_final,
+                "put_score": put_final,
+                "straddle_score": straddle_final,
+                "pcr": flow.get("pcr"),
+                "atm_iv": flow.get("atm_iv"),
+                "same_day_options": len(same_day),
+                "straddle_blocked": straddle.get("blocked"),
+                "straddle_blockers": straddle.get("blockers", [])[:3],
+                "call_reasons": call["reasons"],
+                "put_reasons": put["reasons"],
+                "straddle_reasons": straddle["reasons"],
+                "last_signal": "NO_TRADE",
+                "last_reasons": [],
+            }
+        except Exception as _eval_err:
+            # 主计算段异常（脏数据/字段缺失等）不应冻结快照：明确写 error 状态，
+            # 前端可立即看出评估失败，而不是停在上一轮陈旧数据
+            logger.error(f"末日期权主计算异常: {_eval_err}", exc_info=True)
+            self.last_scores = {
+                "status": "error",
+                "updated_at": fmt_ts(),
+                "updated_ts": time.time(),
+                "message": f"评估异常: {_eval_err}",
+                "price": self.index_price or getattr(self.market, "last_price", 0),
+                "last_signal": "NO_TRADE",
+                "last_reasons": [],
+            }
+            return None
 
         # 决策
         signal = None

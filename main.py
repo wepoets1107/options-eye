@@ -4,10 +4,12 @@
 启动 Deribit WebSocket 数据流、SABR 校准引擎、信号引擎、推送通知和 Web 工作台
 """
 import asyncio
+import json
 import logging
 import logging.handlers
 import os
 import time
+import urllib.request
 from pathlib import Path
 
 import yaml
@@ -20,9 +22,23 @@ from sabr.calibrator import calibrate_all
 from strategy.detector import detect_deviations, generate_signals
 from notification.notifier import NotificationManager
 from notification.bnb_client import RollingMarket, BinanceFuturesClient
-from notification.expiry_scorer import ExpiryScorer
+from notification.expiry_scorer import ExpiryScorer, fmt_ts
 
 logger = logging.getLogger(__name__)
+
+
+async def _rest_get_json(url: str, timeout: float = 10) -> dict:
+    """非阻塞 REST GET（用线程池跑同步 urllib，避免阻塞 asyncio 事件循环）。
+
+    主循环是单线程事件循环，同步 urlopen 会在控制连接断开时每轮阻塞数秒到
+    十几秒（整个循环卡住）。这里用 asyncio.to_thread 把阻塞调用丢到线程池，
+    主循环继续响应其它协程。
+    """
+    def _do():
+        req = urllib.request.Request(url, headers={"User-Agent": "options-eye/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    return await asyncio.to_thread(_do)
 
 
 def setup_logging(config: dict):
@@ -241,12 +257,14 @@ async def expiry_eval_loop(web_state: dict):
                 if hasattr(ws, "index_price"):
                     idx = ws.index_price.get("btc_usd", 0)
                 if not idx:
-                    import json, urllib.request
-                    r = urllib.request.urlopen(
-                        "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd",
-                        timeout=8
-                    )
-                    idx = json.loads(r.read())["result"]["index_price"]
+                    try:
+                        d = await _rest_get_json(
+                            "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd",
+                            timeout=8
+                        )
+                        idx = d["result"]["index_price"]
+                    except Exception:
+                        pass
             except Exception:
                 pass
 
@@ -271,11 +289,9 @@ async def expiry_eval_loop(web_state: dict):
                 logger.warning(f"末日期权拉取 Deribit(WS)失败: {e}，尝试 REST 兜底")
                 # REST 兜底：控制连接断开时也能继续评估（不依赖 WS 控制连接）
                 try:
-                    import json as _json
-                    import urllib.request as _req
                     _url = "https://www.deribit.com/api/v2/public/get_book_summary_by_currency?currency=BTC"
-                    _resp = _req.urlopen(_url, timeout=10)
-                    raw_list = _json.loads(_resp.read()).get("result", [])
+                    _data = await _rest_get_json(_url, timeout=10)
+                    raw_list = _data.get("result", [])
                     for o in raw_list:
                         name = o.get("instrument_name")
                         c = ws.ticker_cache.get(name)
@@ -298,6 +314,23 @@ async def expiry_eval_loop(web_state: dict):
                     asyncio.create_task(notif.push_expiry_signal(sig))
                 else:
                     pass  # 数据不足或未触发
+            else:
+                # 指数价或合约列表都拿不到（WS+REST 均失败），明确标记数据源不可用，
+                # 避免前端继续显示上一轮陈旧快照、看不出失败
+                web_state["expiry_state"] = {
+                    "status": "data_unavailable",
+                    "updated_at": fmt_ts(),
+                    "updated_ts": time.time(),
+                    "message": "Deribit 指数价或期权合约列表获取失败（WS+REST 兜底均失败）",
+                    "has_index": bool(idx),
+                    "option_count": len(opts),
+                    "last_signal": "NO_TRADE",
+                    "last_reasons": [],
+                }
+                logger.warning(
+                    "末日期权数据源不可用，跳过本轮评估（指数=%s, 合约=%d）",
+                    bool(idx), len(opts)
+                )
         except Exception as e:
             logger.warning(f"末日期权评分异常: {e}")
         await asyncio.sleep(15)  # 每15秒评估一次
@@ -349,15 +382,14 @@ async def main():
     market = RollingMarket()
     # 启动时从 Binance REST 回填历史 K 线和成交数据，避免等 65 分钟积累
     try:
-        import json, urllib.request
         url_k = "https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1m&limit=70"
-        resp = urllib.request.urlopen(url_k, timeout=10)
-        for k in json.loads(resp.read().decode()):
+        kdata = await _rest_get_json(url_k, timeout=10)
+        for k in kdata:
             market.add_kline(k[0], float(k[4]), float(k[2]), float(k[3]), float(k[5]))
         # 拉最近 aggTrades 填充成交数据
         url_t = "https://fapi.binance.com/fapi/v1/aggTrades?symbol=BTCUSDT&limit=50"
-        resp2 = urllib.request.urlopen(url_t, timeout=10)
-        for t in json.loads(resp2.read().decode()):
+        tdata = await _rest_get_json(url_t, timeout=10)
+        for t in tdata:
             side = -1 if t.get("m") else 1
             market.add_trade(int(t["T"]), float(t["p"]), float(t["q"]), side)
         logger.info(f"末日期权历史回填完成: {len(market.closes)} K线, {len(market.trades)} 成交")

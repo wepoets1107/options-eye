@@ -47,6 +47,7 @@ class _TickerConn:
         self._lock = asyncio.Lock()
         self.subscribed: set = set()       # 当前已订阅的频道
         self.running = False
+        self.retry_count = 0               # 重连尝试计数（供 recv 循环重连时续传退避）
 
 
 class DeribitWS:
@@ -88,17 +89,22 @@ class DeribitWS:
 
         # 轮转循环只启动一次（避免 contracts 刷新时重复 create_task）
         self._rotation_started = False
+        # 看门狗协程引用（关闭时取消，避免协程泄漏）
+        self._watchdog_task = None
+        # 指数订阅状态（重连后需重新订阅，避免永久丢失）
+        self._index_subscribed = False
 
     # ============ 连接管理 ============
     async def connect(self):
         """建链 + 初始化全部订阅（一次性，运行期不再轮询）"""
         await self._connect_main()
         self._supervisor_task = asyncio.create_task(self._supervisor())
-        asyncio.create_task(self._watchdog())
+        self._watchdog_task = asyncio.create_task(self._watchdog())
         # 拉合约列表 -> 建立 ticker 订阅（全推送起点）
         await self._init_chain()
         # 指数订阅
         await self.subscribe_index()
+        self._index_subscribed = True
         # 一次性冷启动填充：保证首轮主循环立即有数据；之后由 ticker 推送维护
         try:
             await self.get_book_summary_by_currency("BTC")
@@ -120,6 +126,7 @@ class DeribitWS:
         self.ws = await websockets.connect(self.url, ping_interval=30)
         self._running = True
         self._recv_task = asyncio.create_task(self._control_recv_loop())
+        self._index_subscribed = False   # 新连接尚未订阅指数，待 _supervisor 补订阅
         logger.info("Deribit 控制连接已建立")
 
     async def _control_recv_loop(self):
@@ -146,24 +153,40 @@ class DeribitWS:
         - 去掉原 10 次硬上限，改为无限重试直到恢复
         - 指数退避：普通失败 5→10→20→40→80→120s 封顶；
           HTTP 429 限流 60→120→240→300s 封顶（Deribit 对握手频率限流）
+        - 重连成功后确保指数订阅恢复；订阅失败则下轮独立重试（不依赖 recv 断开，
+          否则 recv 仍存活时会被卡在 sleep 分支、指数订阅永久丢失）
         """
         while not self._shutdown:
+            # 1) 重连（recv 协程断开时）
             if self._recv_task is None or self._recv_task.done():
                 try:
-                    await self._connect_main()
-                    await self.subscribe_index()
-                    logger.info("控制连接重连成功")
+                    await self._connect_main()      # 内部置 _index_subscribed=False
                     self._reconn_attempt = 0
                 except Exception as e:
                     self._reconn_attempt += 1
                     attempt = self._reconn_attempt
+                    # 判定是否 HTTP 429 限流（握手频率限制）。websockets 握手限流抛
+                    # InvalidStatusCode，其 str 含 "429" 且带 .status 属性，两种都判。
                     is_429 = "429" in str(e) or "Too Many" in str(e)
+                    status = getattr(e, "status", None)
+                    if status == 429:
+                        is_429 = True
                     if is_429:
                         wait = min(60 * (2 ** min(attempt, 3)), 300)
                     else:
                         wait = min(5 * (2 ** min(attempt, 5)), 120)
                     logger.error(f"控制重连第{attempt}次失败，{wait}s 后重试: {e}")
                     await asyncio.sleep(wait)
+                    continue
+            # 2) 连接健康时，确保指数订阅成功（失败则下轮重试，不卡死）
+            elif not self._index_subscribed:
+                try:
+                    await self.subscribe_index()
+                    self._index_subscribed = True
+                    logger.info("控制连接重连成功（指数订阅已恢复）")
+                except Exception as e:
+                    logger.warning(f"指数订阅失败，下轮重试: {e}")
+                    await asyncio.sleep(5)
                     continue
             await asyncio.sleep(2)
 
@@ -212,6 +235,8 @@ class DeribitWS:
         self._shutdown = True
         if self._supervisor_task is not None:
             self._supervisor_task.cancel()
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
         if self._recv_task is not None and not self._recv_task.done():
             self._recv_task.cancel()
         self._running = False
@@ -333,6 +358,7 @@ class DeribitWS:
                 conn.subscribed = target_set.copy()
 
     async def _ticker_connect(self, conn: _TickerConn, retry_count: int = 0):
+        conn.retry_count = retry_count   # 记录当前尝试，供 recv 循环重连时续传退避
         try:
             conn.ws = await websockets.connect(self.url, ping_interval=30)
             # 重连后清空已订阅集合，强制下一轮轮转重新订阅（否则 subscribed
@@ -371,7 +397,7 @@ class DeribitWS:
             logger.warning(f"ticker 连接#{conn.idx} recv 错误: {e}")
             conn.running = False
             await asyncio.sleep(3)
-            asyncio.create_task(self._ticker_connect(conn))
+            asyncio.create_task(self._ticker_connect(conn, getattr(conn, "retry_count", 0)))
 
     async def _tconn_send(self, conn: _TickerConn, method: str, params: dict, timeout: float = 10.0) -> dict:
         for _ in range(50):
@@ -470,7 +496,7 @@ class DeribitWS:
 
     # ============ 看门狗：监控 ticker 推送静默并自愈 ============
     async def _watchdog(self):
-        while True:
+        while not self._shutdown:
             await asyncio.sleep(15)
             if not self.last_ticker_ts:
                 continue
