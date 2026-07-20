@@ -10,6 +10,7 @@ import time
 from typing import Optional
 
 from notification.store import push_count_today, last_push_ts, mark_pushed, append_log
+from notification.store import has_conflicting_legs, save_pushed_legs
 from notification.channels.email import send_email
 from notification.channels.telegram import send_telegram
 from notification.channels.wechat import send_wechat
@@ -29,8 +30,22 @@ class NotificationManager:
         self.tg_cfg = self.cfg.get("telegram", {})
         self.wx_cfg = self.cfg.get("wechat", {})
 
-        # 进程内去重缓存（防止 read-check-write 竞争条件导致重复推送）
+        # 进程内去重缓存（启动时从文件恢复，重启不丢失）
         self._pushed_this_run: set = set()
+        self._restore_pushed_state()
+
+    def _restore_pushed_state(self):
+        """从持久化文件恢复去重状态（防重启后重复推送）"""
+        from notification.store import _load_pushed
+        today = time.strftime("%Y-%m-%d")
+        pushed = _load_pushed()
+        restored = 0
+        for full_key in pushed:
+            if full_key.startswith(f"{today}_sabr_"):
+                self._pushed_this_run.add(full_key)
+                restored += 1
+        if restored:
+            logger.info(f"从文件恢复 {restored} 条今日推送记录（防重启重复）")
 
     async def push_sabr_signals(self, signals: list[dict]) -> int:
         """推送 SABR 策略信号
@@ -52,7 +67,7 @@ class NotificationManager:
             logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
             return 0
 
-        # 筛选当天未推过的 high 信号（含进程内缓存防并发）
+        # 筛选当天未推过的 high 信号（含进程内缓存防并发 + 跨周期模糊去重）
         new_signals = []
         for s in signals:
             if s.get("confidence") != "high":
@@ -64,6 +79,12 @@ class NotificationManager:
             c = push_count_today(key)
             if c >= 1:
                 self._pushed_this_run.add(key)
+                continue
+            # 跨周期模糊去重：同策略+共享腿→和今天已推过的历史信号去重
+            s_legs = {l["instrument"] for l in s.get("legs", [])}
+            if has_conflicting_legs(s.get("strategy_type", ""), s_legs):
+                self._pushed_this_run.add(key)
+                logger.info(f"跨周期模糊去重: {s.get('strategy_type')} {s.get('currency')} {s.get('description','')[:50]}")
                 continue
             new_signals.append(s)
 
@@ -101,6 +122,8 @@ class NotificationManager:
             for s in new_signals:
                 key = f"sabr_{s.get('id', '')}"
                 mark_pushed(key)
+                legs = {l["instrument"] for l in s.get("legs", [])}
+                save_pushed_legs(s.get("strategy_type", ""), legs)
                 append_log({
                     "ts": int(time.time()),
                     "type": "sabr",
