@@ -1,6 +1,8 @@
 """
 电报推送通道 — 通过 Telegram Bot API 发送消息到冰火岛期权Club群
-配置：TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 从 .env 或环境变量读取
+凭据来源（优先级）：环境变量 TELEGRAM_BOT_TOKEN/TELEGRAM_CHAT_ID > 注入凭据 > 无
+注入方式：NotificationManager 初始化时调用 set_credentials(token, chat_id)
+真实 bot_token/chat_id 仅存在于本地 config.yaml（gitignored），不进入代码仓库。
 """
 import asyncio
 import json
@@ -10,15 +12,22 @@ import urllib.parse
 
 logger = logging.getLogger(__name__)
 
-# 默认值（从 .env 或环境变量覆盖）
-_DEFAULT_TOKEN = "8811187609:AAH_f0KytsCJq20-w_riYfG9JZSebxiAix0"
-_DEFAULT_CHAT_ID = "-1004386546323"
+# 凭据由 set_credentials 注入（来自本地 config.yaml），绝不在源码里硬编码
+_BOT_TOKEN = ""
+_CHAT_ID = ""
+
+
+def set_credentials(bot_token: str, chat_id: str) -> None:
+    """由 NotificationManager 从本地 config 注入凭据（config.yaml 不入库）"""
+    global _BOT_TOKEN, _CHAT_ID
+    _BOT_TOKEN = bot_token or ""
+    _CHAT_ID = chat_id or ""
 
 
 def _get_config():
     import os
-    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", _DEFAULT_TOKEN)
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", _DEFAULT_CHAT_ID)
+    bot_token = os.environ.get("TELEGRAM_BOT_TOKEN") or _BOT_TOKEN
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID") or _CHAT_ID
     return bot_token, chat_id
 
 

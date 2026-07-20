@@ -13,7 +13,7 @@ from typing import Optional
 from notification.store import push_count_today, last_push_ts, mark_pushed, append_log
 from notification.store import has_conflicting_legs, save_pushed_legs
 from notification.channels.email import send_email
-from notification.channels.telegram import send_telegram
+from notification.channels.telegram import send_telegram, set_credentials
 from notification.channels.wechat import send_wechat
 
 logger = logging.getLogger(__name__)
@@ -30,6 +30,13 @@ class NotificationManager:
         self.email_cfg = self.cfg.get("email", {})
         self.tg_cfg = self.cfg.get("telegram", {})
         self.wx_cfg = self.cfg.get("wechat", {})
+
+        # 注入电报凭据（来自本地 config.yaml，gitignored，不入库）
+        if self.tg_cfg.get("enabled"):
+            set_credentials(
+                self.tg_cfg.get("bot_token", ""),
+                self.tg_cfg.get("chat_id", ""),
+            )
 
         # 进程内去重缓存（启动时从文件恢复，重启不丢失）
         self._pushed_this_run: set = set()

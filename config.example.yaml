@@ -47,6 +47,22 @@ web:
   host: "127.0.0.1"
   port: 5051
 
+# 推送通知
+notification:
+  enabled: true
+
+  email:
+    enabled: false
+    from_addr: "你的发件邮箱"
+    to_addr: "你的收件邮箱"
+
+  telegram:
+    enabled: true
+    # 下面两值仅本地 config.yaml 填写（gitignored，不入库）；此处留空占位
+    # 也可通过环境变量 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 提供
+    bot_token: ""
+    chat_id: ""
+
 # 日志
 logging:
   level: "INFO"
