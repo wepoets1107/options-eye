@@ -218,8 +218,7 @@ class NotificationManager:
 
         # 电报
         if self.tg_cfg.get("enabled"):
-            chat_id = self.tg_cfg.get("chat_id", "-1004386546323")
-            ok, detail = await send_telegram(body, chat_id)
+            ok, detail = await send_telegram(body)
             results.append(("telegram", ok, detail))
             if ok:
                 logger.info("电报推送成功")
