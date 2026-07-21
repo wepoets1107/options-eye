@@ -268,10 +268,11 @@ async def expiry_eval_loop(web_state: dict):
             except Exception:
                 pass
 
-            # 拉 Deribit 期权 book_summary
+            # 拉 Deribit 期权 book_summary（运行期：update_cache=False，绝不写回 ticker_cache，
+            # 否则空 greeks 会覆盖 ticker 推送的真实 greeks，把 BTC delta 清零）
             opts = []
             try:
-                raw = await ws.get_book_summary_by_currency("BTC")
+                raw = await ws.get_book_summary_by_currency("BTC", update_cache=False)
                 raw_list = raw if isinstance(raw, list) else []
                 if not raw_list:
                     raise ValueError("book_summary 为空")

@@ -456,17 +456,23 @@ class DeribitWS:
         }
 
     # ============ 冷启动 / 兜底：一次性拉取 ============
-    async def get_book_summary_by_currency(self, currency: str) -> list[dict]:
-        """仅用于冷启动即时填充（非运行期轮询）。结果写入同一 ticker_cache。"""
+    async def get_book_summary_by_currency(self, currency: str, update_cache: bool = True) -> list[dict]:
+        """冷启动即时填充（非运行期轮询）。
+
+        update_cache=True（默认）：归一化结果写入 ticker_cache，供冷启动/切片构建使用。
+        update_cache=False：仅返回原始 API 数据，绝不触碰 ticker_cache——用于末日期权
+        循环等运行期场景，避免 book_summary 不含 greeks 的空数据覆盖 ticker 实时推送的
+        真实 greeks（否则会把 delta 清零，导致 BTC 偏差检测全被剔除、前端空白）。
+        """
         r = await self._send("public/get_book_summary_by_currency", {
             "currency": currency, "kind": "option"
         })
         for item in r:
             norm = self._normalize(item)
-            if norm:
+            if norm and update_cache:
                 self.ticker_cache[norm["instrument_name"]] = norm
         self.last_ticker_ts = time.time()
-        logger.info(f"冷启动填充 {currency}: {len(r)} 条")
+        logger.info(f"book_summary 填充 {currency}: {len(r)} 条 (update_cache={update_cache})")
         return r
 
     # ============ 对外读取（纯缓存，无网络） ============

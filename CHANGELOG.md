@@ -1,5 +1,17 @@
 # 期权天眼 更新日志
 
+## 0.16.0 (2026-07-21) 修复 BTC SABR 偏差前端空白（数据源隔离）
+
+末日期权循环每轮调用 `get_book_summary_by_currency("BTC")` 会顺手把归一化结果写回 `ticker_cache`，而 book_summary 不含 greeks，于是把 ticker 实时推送的 BTC 真实 greeks（含 delta）反复清空成 0。detector 的 `0.05 ≤ |delta| ≤ 0.25` 硬门槛把 BTC 合约全踢掉，导致 BTC 0 偏差、前端「BTC SABR 偏差」整片空白（ETH 不受影响，因为末日期权只看 BTC、从不灌 ETH 的 book_summary）。
+
+### 修复（方案 B：彻底隔离两条数据流）
+- `data/deribit_ws.py`：`get_book_summary_by_currency` 新增 `update_cache: bool = True` 参数。`update_cache=False` 时仅返回原始 API 数据、**绝不写回 `ticker_cache`**，避免空 greeks 覆盖 ticker 推送的真实 greeks。
+- `main.py`：末日期权循环对该调用传 `update_cache=False`，book_summary 结果用独立变量 `opts` 承载，与 `ticker_cache` 完全解耦；REST 兜底段只读 `ticker_cache` 取真实 greeks（不改写）。
+
+### 验证
+- BTC 切片 delta 有值率：2.7%（13/476）→ 98.9%（471/476）
+- BTC 偏差数：0 → 101（ETH 53，共 154）；前端 BTC SABR 偏差恢复显示
+
 ## 0.15.0 (2026-07-20) 交叉检查 bug 修复（连接健壮性 + 末日期权评估容错）
 
 对上一轮修改做代码交叉检查，修复 8 个 bug（P0~P2），提升连接自愈与评估容错。
