@@ -6,7 +6,7 @@
   订阅频道推送（该频道自带 mark_iv / bid_iv / ask_iv / greeks / mark_price /
   open_interest，一个订阅替代原先的两处轮询）。
 - Deribit 限制每连接最多 200 个订阅，并发连接数过多会触发服务端限流。
-  因此限制最多 3 个连接（3×200=600 频道），优先覆盖主力合约。
+  因此全局 WebSocket 并发硬上限 3 个（控制连接 1 + ticker ≤2），ticker 连接默认 1 个（分批轮转覆盖全量）。
 - 仅「获取合约列表」「指数价兜底」等极少数控制请求走主连接按需发送；
   运行期不轮询任何行情接口，避免触发限流/封禁。
 - book.{currency}.summary 推送频道经实测不推送数据，故不作为数据源。
@@ -23,8 +23,13 @@ logger = logging.getLogger(__name__)
 
 # 每连接最大订阅数（Deribit 硬上限 200，不留余量）
 MAX_SUBS_PER_CONN = 200
-# 只使用 1 个连接，分批轮转采集（任何时候只订阅 1 批）
-MAX_TICKER_CONNS = 1
+# ticker 订阅连接硬上限（用户要求 ≤2）；当前实际启用见 TICKER_CONNS_ACTIVE
+MAX_TICKER_CONNS = 2
+# 全局 WebSocket 并发硬上限：控制连接(1) + ticker(≤2) 合计 ≤3，超限不再新建
+MAX_WS_TOTAL = 3
+# 实际启用的 ticker 连接数（必须 ≤ MAX_TICKER_CONNS）。1 个已稳定覆盖全量，
+# 且握手频率最低、最不易触发 Deribit 429 限流；需更快覆盖时再上调至 2。
+TICKER_CONNS_ACTIVE = 1
 # 每批采集时长（秒）
 BATCH_DWELL_SEC = 30
 # ticker 推送间隔：Deribit 公共连接实测仅 100ms（及 raw 需认证）真正推送；
@@ -288,13 +293,17 @@ class DeribitWS:
         n_batch = max(1, (total + MAX_SUBS_PER_CONN - 1) // MAX_SUBS_PER_CONN)
         logger.info(f"全量合约 {total} 个，分 {n_batch} 批采集（每批 ≤{MAX_SUBS_PER_CONN}，每批 {BATCH_DWELL_SEC}s）")
 
-        # 确保有且仅有 1 个连接
+        # 确保 ticker 连接数不超过硬上限（清理多余），且全局 WS 并发 ≤ MAX_WS_TOTAL
         while len(self.ticker_conns) > MAX_TICKER_CONNS:
             extra = self.ticker_conns.pop()
             extra.running = False
             if extra.ws:
                 asyncio.create_task(extra.ws.close())
-        while len(self.ticker_conns) < MAX_TICKER_CONNS:
+        # 补足到实际启用数（受全局并发上限保护：控制1 + ticker 数 < MAX_WS_TOTAL）
+        while len(self.ticker_conns) < TICKER_CONNS_ACTIVE:
+            if 1 + len(self.ticker_conns) >= MAX_WS_TOTAL:
+                logger.warning(f"已达全局 WS 并发上限 {MAX_WS_TOTAL}，停止新建 ticker 连接")
+                break
             conn = _TickerConn(self.url, len(self.ticker_conns), self.ticker_cache, self._on_ticker)
             self.ticker_conns.append(conn)
             asyncio.create_task(self._ticker_connect(conn))
@@ -357,7 +366,17 @@ class DeribitWS:
                 # subscribe 失败后仍然更新 subscribed 为目标集，防止死循环重试
                 conn.subscribed = target_set.copy()
 
+    def _calc_backoff(self, attempt: int, is_429: bool) -> int:
+        """重连退避：429 限流 60→120→240→300s 封顶；普通错误 5→10→...→120s 封顶"""
+        if is_429:
+            return min(60 * (2 ** min(attempt, 3)), 300)
+        return min(5 * (2 ** min(attempt, 5)), 120)
+
     async def _ticker_connect(self, conn: _TickerConn, retry_count: int = 0):
+        # 防重连协程累积：同一 conn 同时只跑 1 个重连协程，避免握手风暴触发 429
+        if getattr(conn, "_reconnecting", False):
+            return
+        conn._reconnecting = True
         conn.retry_count = retry_count   # 记录当前尝试，供 recv 循环重连时续传退避
         try:
             conn.ws = await websockets.connect(self.url, ping_interval=30)
@@ -365,21 +384,26 @@ class DeribitWS:
             # 与 target 一致会判定为空操作，连接空转 → 看门狗反复重连）
             conn.subscribed = set()
             conn.running = True
+            conn._reconnecting = False
             logger.info(f"ticker 连接#{conn.idx} 已建立")
             await self._ticker_recv_loop(conn)
         except websockets.ConnectionClosed as e:
-            if "over_limit" in str(e):
-                wait = min(60 * (retry_count + 1), 300)
-                logger.warning(f"ticker#{conn.idx} 被限流(over_limit)，等待 {wait}s 后重连")
-                await asyncio.sleep(wait)
-            else:
-                await asyncio.sleep(3)
             conn.running = False
+            conn._reconnecting = False
+            is_429 = ("429" in str(e) or "Too Many" in str(e)
+                       or getattr(e, "status", None) == 429)
+            wait = self._calc_backoff(retry_count, is_429)
+            logger.warning(f"ticker#{conn.idx} 连接关闭(429={is_429})，{wait}s 后重连: {e}")
+            await asyncio.sleep(wait)
             asyncio.create_task(self._ticker_connect(conn, retry_count + 1))
         except Exception as e:
-            logger.error(f"ticker 连接#{conn.idx} 错误: {e}")
             conn.running = False
-            await asyncio.sleep(3)
+            conn._reconnecting = False
+            is_429 = ("429" in str(e) or "Too Many" in str(e)
+                       or getattr(e, "status", None) == 429)
+            wait = self._calc_backoff(retry_count, is_429)
+            logger.error(f"ticker 连接#{conn.idx} 错误(429={is_429})，{wait}s 后重连: {e}")
+            await asyncio.sleep(wait)
             asyncio.create_task(self._ticker_connect(conn, retry_count + 1))
 
     async def _ticker_recv_loop(self, conn: _TickerConn):
@@ -396,8 +420,9 @@ class DeribitWS:
         except Exception as e:
             logger.warning(f"ticker 连接#{conn.idx} recv 错误: {e}")
             conn.running = False
-            await asyncio.sleep(3)
-            asyncio.create_task(self._ticker_connect(conn, getattr(conn, "retry_count", 0)))
+            # 交给 _ticker_connect 统一退避重连（其入口有 _reconnecting 防累积）
+            if not getattr(conn, "_reconnecting", False):
+                asyncio.create_task(self._ticker_connect(conn, getattr(conn, "retry_count", 0)))
 
     async def _tconn_send(self, conn: _TickerConn, method: str, params: dict, timeout: float = 10.0) -> dict:
         for _ in range(50):

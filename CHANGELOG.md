@@ -1,5 +1,43 @@
 # 期权天眼 更新日志
 
+## 0.19.0 (2026-07-21) 收紧 WebSocket 并发 + 修复 ticker 重连风暴
+
+岛主指出 ticker 连接数需严格控制（≤2），且 WebSocket 订阅易触发 Deribit 限流，要求全局并发不超过 3 个。排查发现：当时实际只有 2 个 WS 连接（控制 1 + ticker 1，已 ≤3），日志里的"批次 2/8"是订阅分批轮转而非连接数；真正导致 429 刷屏的是**重连风暴**——ticker 连接被拒后仅 sleep(3) 即无限重连，维护期可能累积多个重连协程并发握手，反而把限流打得更死。
+
+### 修改
+- `data/deribit_ws.py`：新增 `MAX_TICKER_CONNS=2`（ticker 连接硬上限）、`MAX_WS_TOTAL=3`（全局 WS 并发硬上限，控制 1 + ticker ≤2）、`TICKER_CONNS_ACTIVE=1`（实际启用数，最稳且握手频率最低）。`manage_ticker_subscriptions` 创建循环加全局并发保护（控制 1 + 当前 ticker 数 ≥ 上限则停止新建）。
+- 新增 `_calc_backoff(attempt, is_429)`：429 限流退避 60→120→240→300s 封顶，普通错误 5→10→...→120s 封顶。
+- `_ticker_connect` 重写：入口加 `conn._reconnecting` 标志，**防止同一 conn 多个重连协程并发累积**（这是握手风暴的根因）；429 判定扩展为 "429"/"Too Many"/status==429；原 `sleep(3)` 无脑重连改为 `_calc_backoff` 退避。
+- `_ticker_recv_loop` 异常重连改为交给 `_ticker_connect` 统一退避（入口拦截并发），不再自睡眠后裸重连。
+
+### 说明
+- 实际 ticker 连接维持 1 个（满足"≤2"），分批轮转覆盖全量合约的架构不变；如需更快覆盖可上调 `TICKER_CONNS_ACTIVE` 至 2，但握手频率翻倍、更易 429，非必要不动。
+- 若 Deribit 临时维护，重连退避会让节奏自动放缓（60s 起），不会因频繁握手加剧限流。
+
+## 0.18.0 (2026-07-21) SABR 合并推送冷却 8 小时 → 4 小时
+
+岛主认为 8 小时冷却偏长，medium/ETH 信号刚冒头要等很久才推。现将 `push_sabr_signals` 的合并推送冷却窗口由 8 小时缩短为 4 小时。排重（按 signal_id 每日去重 + 跨周期模糊去重）、分片发送、强度排序等逻辑全部不变。
+
+### 修改
+- `notification/notifier.py`：`COOLDOWN_SEC` 由 `8 * 3600` 改为 `4 * 3600`；docstring 同步更新为「每 4 小时最多推送 1 次」。
+
+### 说明
+- 冷却只管推送频率（节流/聚合），不负责去重；去重仍由稳定 signal_id 与腿级模糊匹配保证，缩短冷却不影响去重强度。
+- 每轮扫描新冒出的、id 全新的信号会在下一个冷却窗口（≤4 小时）被合并推送，推送更及时，但仍不至于刷屏。
+
+## 0.17.0 (2026-07-21) SABR 信号推送放开 medium 档
+
+岛主希望电报群能看到更多 ETH 信号（ETH IV 曲面异常偏弱，多数只够到 medium 档，原逻辑只推 high 三星导致推送几乎全是 BTC）。现将推送门槛从仅 high 扩大到 high + medium（low 仍不推）。
+
+### 修改
+- `notification/notifier.py`：`push_sabr_signals` 的候选过滤由 `confidence != "high"` 改为 `confidence not in ("high", "medium")`。
+- 候选信号按强度（high 优先，其次按 |Z| 降序）排序后**分片发送**，每片最多 15 条，避免单条电报消息超过 4096 字符上限而推送失败。多片时在标题注明「第 x/N 批，共 M 条」。
+- 保留原有 8 小时冷却、按 signal_id 每日去重、跨周期模糊去重（同策略+共享腿）。
+
+### 说明
+- medium 信号数量远大于 high（当前偏差池 medium 占多数），放开后每次合并推送窗口信号会显著变多，电报群可能连发多条；若觉得刷屏可再调阈值或恢复仅 high。
+- 8 小时冷却与每日去重不变，单条信号当天最多推 1 次。
+
 ## 0.16.0 (2026-07-21) 修复 BTC SABR 偏差前端空白（数据源隔离）
 
 末日期权循环每轮调用 `get_book_summary_by_currency("BTC")` 会顺手把归一化结果写回 `ticker_cache`，而 book_summary 不含 greeks，于是把 ticker 实时推送的 BTC 真实 greeks（含 delta）反复清空成 0。detector 的 `0.05 ≤ |delta| ≤ 0.25` 硬门槛把 BTC 合约全踢掉，导致 BTC 0 偏差、前端「BTC SABR 偏差」整片空白（ETH 不受影响，因为末日期权只看 BTC、从不灌 ETH 的 book_summary）。

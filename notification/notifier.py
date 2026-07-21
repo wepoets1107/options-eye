@@ -61,14 +61,15 @@ class NotificationManager:
         """推送 SABR 策略信号
 
         规则：
-        - 仅推送 confidence=high（三星）的信号
+        - 推送 confidence=high（三星）和 medium（双星）的信号（low 不推）
         - 同一信号（signal_id）每天只推 1 次
-        - 合并消息每 8 小时最多推送 1 次（COOLDOWN_HOURS）
+        - 合并消息每 4 小时最多推送 1 次（COOLDOWN_HOURS）
+        - 候选过多时按强度分片发送，避免单条电报消息超长（4096 字符上限）
         """
         if not self.enabled or not signals:
             return 0
 
-        COOLDOWN_SEC = 8 * 3600  # 8 小时冷却
+        COOLDOWN_SEC = 4 * 3600  # 4 小时冷却
 
         async with self._push_lock:
             # 每 8 小时最多一次合并推送（锁内判断，避免并发重复）
@@ -78,10 +79,10 @@ class NotificationManager:
                 logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
                 return 0
 
-            # 筛选当天未推过的 high 信号（含进程内缓存防并发 + 跨周期模糊去重）
+            # 筛选当天未推过的 high/medium 信号（含进程内缓存防并发 + 跨周期模糊去重）
             new_signals = []
             for s in signals:
-                if s.get("confidence") != "high":
+                if s.get("confidence") not in ("high", "medium"):
                     continue
                 key = f"sabr_{s.get('id', '')}"
                 # 进程内缓存检查（防竞争条件）
@@ -120,38 +121,57 @@ class NotificationManager:
             if not new_signals:
                 return 0
 
+            # 排序：high 优先，其次按强度(|Z|)降序，确保最强信号排在前面先展示
+            def _strength(s):
+                devs = s.get("deviations") or []
+                zs = [abs(getattr(d, "z_score", 0)) for d in devs]
+                return max(zs) if zs else 0
+            new_signals.sort(key=lambda s: (0 if s.get("confidence") == "high" else 1, -_strength(s)))
+
             # 发送前锁定进程内缓存（防止发送期间的竞争）
+            total = len(new_signals)
             batch_keys = [f"sabr_{s.get('id', '')}" for s in new_signals]
             for k in batch_keys:
                 self._pushed_this_run.add(k)
 
-            # 合并成一条消息推送
-            body = self._format_sabr_batch(new_signals)
-            ok = await self._dispatch(body, "[期权天眼] SABR 信号汇总")
-            if ok:
-                mark_pushed(batch_key)
-                for s in new_signals:
-                    key = f"sabr_{s.get('id', '')}"
-                    mark_pushed(key)
-                    legs = {l["instrument"] for l in s.get("legs", [])}
-                    save_pushed_legs(s.get("strategy_type", ""), legs)
-                    append_log({
-                        "ts": int(time.time()),
-                        "type": "sabr",
-                        "signal_id": s.get("id", ""),
-                        "currency": s.get("currency", ""),
-                        "strategy": s.get("strategy_type", ""),
-                        "direction": s.get("direction", ""),
-                        "description": s.get("description", "")[:80],
-                    })
+            # 分片发送：每片最多 MAX_PER_MSG 条，避免单条电报消息超长（Telegram 4096 字符上限）
+            MAX_PER_MSG = 15
+            chunks = [new_signals[i:i + MAX_PER_MSG] for i in range(0, total, MAX_PER_MSG)]
+            pushed_total = 0
+            for ci, chunk in enumerate(chunks):
+                note = f"（第 {ci + 1}/{len(chunks)} 批，共 {total} 条 high/medium 信号）" if len(chunks) > 1 else ""
+                body = self._format_sabr_batch(chunk, note)
+                ok = await self._dispatch(body, "[期权天眼] SABR 信号汇总")
+                if ok:
+                    mark_pushed(batch_key)  # 冷却标记（幂等，按最后成功片刷新）
+                    for s in chunk:
+                        key = f"sabr_{s.get('id', '')}"
+                        mark_pushed(key)
+                        legs = {l["instrument"] for l in s.get("legs", [])}
+                        save_pushed_legs(s.get("strategy_type", ""), legs)
+                        append_log({
+                            "ts": int(time.time()),
+                            "type": "sabr",
+                            "signal_id": s.get("id", ""),
+                            "currency": s.get("currency", ""),
+                            "strategy": s.get("strategy_type", ""),
+                            "direction": s.get("direction", ""),
+                            "description": s.get("description", "")[:80],
+                        })
+                    pushed_total += len(chunk)
+                else:
+                    logger.warning(f"SABR 第 {ci + 1}/{len(chunks)} 批推送失败，停止后续分片")
+                    break
 
-            pushed = len(new_signals)
-            logger.info(f"SABR 合并推送完成: {pushed} 条新信号")
-            return pushed
+            logger.info(f"SABR 合并推送完成: {pushed_total}/{total} 条新信号")
+            return pushed_total
 
-    def _format_sabr_batch(self, signals: list[dict]) -> str:
+    def _format_sabr_batch(self, signals: list[dict], note: str = "") -> str:
         """将所有信号合并为一条消息（保持与单条推送一致的样式的精简版）"""
-        lines = ["【期权天眼】SABR IV 曲面异常扫描", ""]
+        title = "【期权天眼】SABR IV 曲面异常扫描"
+        if note:
+            title += note
+        lines = [title, ""]
 
         for i, s in enumerate(signals, 1):
             direction_cn = "做多" if s.get("direction") == "long" else "做空"
