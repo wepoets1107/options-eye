@@ -224,7 +224,7 @@ def generate_signals(deviations, slices, sabr_params, z_threshold=2.0, delta_min
             continue
         sabr = sabr_params.get(f"{slice_.currency}_{slice_.expiration}")
         # 传全部 devs 给 _build_signal，保证"有模式就能配对出腿"
-        signal = _build_signal(pattern, devs, slice_, log_mid, now, sabr)
+        signal = _build_signal(pattern, devs, slice_, log_mid, now, sabr, delta_min, delta_max)
         if signal and (pattern["confidence"] == "high" or
                        (pattern["confidence"] == "medium" and abs(pattern["z_avg"]) >= 1.2)):
             _finalize_signal(signal, slice_)
@@ -234,15 +234,64 @@ def generate_signals(deviations, slices, sabr_params, z_threshold=2.0, delta_min
     return signals
 
 
-def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
+def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None, delta_min=0.05, delta_max=0.25):
     """根据偏差模式构建具体策略信号（用 SABR 算真实 Delta）"""
     pattern_type = pattern["pattern"]
     dte = slice_.dte
     currency = devs[0].currency if devs else "BTC"
     devs = [d for d in devs if d.currency == currency]
 
-    def _fmt_delta(d):
-        return f"{abs(d.delta):.2f}"
+    def _fmt_delta(d, action):
+        # 展示持仓 Delta（买卖方向 + 期权原生符号：call +, put -）
+        # 买=与期权 delta 同向，卖=反向；例：买 Put(-0.19)→-0.19，卖 Call(+0.08)→-0.08
+        signed = d.delta if action == "buy" else -d.delta
+        return f"{signed:+.2f}"
+
+    def _build_full_pool(kind):
+        """该到期日全合约池（delta 在 [delta_min, delta_max]，不限 oi），
+        用于配对时找对称腿；z_score 现算（中性腿 z≈0）。"""
+        chain = slice_.calls if kind == "call" else slice_.puts
+        base = []
+        for c in (slice_.calls + slice_.puts):
+            if not (delta_min <= abs(c.delta) <= delta_max):
+                continue
+            if c.mark_iv <= 0:
+                continue
+            try:
+                e = expected_iv(log_mid, c.strike, slice_.dte / 365.0, sabr)
+                if e > 0:
+                    base.append((c.mark_iv - e) * 100)
+            except Exception:
+                pass
+        sigma = max(float(np.std(base, ddof=1)), 0.1) if len(base) > 1 else 0.1
+        pool = []
+        for c in chain:
+            if not (delta_min <= abs(c.delta) <= delta_max):
+                continue
+            if c.mark_iv <= 0:
+                continue
+            try:
+                e = expected_iv(log_mid, c.strike, slice_.dte / 365.0, sabr)
+                if e <= 0:
+                    continue
+                dev = (c.mark_iv - e) * 100
+                z = dev / sigma if sigma > 0 else 0
+                pool.append(IVDeviation(
+                    instrument=c.instrument, currency=c.currency, kind=c.kind,
+                    strike=c.strike, expiration=c.expiration, dte=c.dte,
+                    market_iv=c.mark_iv, sabr_expected_iv=e,
+                    deviation_pt=round(dev, 2), z_score=round(z, 2),
+                    delta=round(c.delta, 4),
+                    bid_iv=c.bid_iv or 0, ask_iv=c.ask_iv or 0,
+                    spread_filter_pass=True, oi_filter_pass=c.open_interest >= 10,
+                    timestamp=int(now)
+                ))
+            except Exception:
+                pass
+        return pool
+
+    full_calls = _build_full_pool("call")
+    full_puts = _build_full_pool("put")
 
     def _find_balanced_partner(primary, all_opposite):
         """找与主腿 Delta 对称的辅腿（不限制 Z 正负）"""
@@ -298,10 +347,10 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not primary_pool:
             return None
 
-        # 从候选主腿中选 Z 绝对值最大的，然后找辅腿
+        # 从候选主腿中选 Z 绝对值最大的，然后找辅腿（全合约池配对）
         primary = max(primary_pool, key=lambda x: abs(x.z_score))
-        opposite = all_puts if primary.kind == "call" else all_calls
-        partner = _find_balanced_partner(primary, opposite)
+        opp_kind = "put" if primary.kind == "call" else "call"
+        partner = _find_balanced_partner(primary, full_puts if opp_kind == "put" else full_calls)
         if not partner:
             return None
 
@@ -313,7 +362,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             f"{currency} {dte}d: "
             f"{prim_act} {primary.instrument} + {part_act} {partner.instrument} "
             f"(主腿Z={primary.z_score:.1f} 辅腿Z={partner.z_score:.1f}, "
-            f"Call Δ={_fmt_delta(call_leg)} Put Δ={_fmt_delta(put_leg)})"
+            f"Call Δ={_fmt_delta(call_leg, prim_act)} Put Δ={_fmt_delta(put_leg, part_act)})"
         ]
 
         return Signal(
@@ -340,7 +389,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not puts or not calls:
             return None
         sell_leg = puts[0]
-        buy_leg = _find_balanced_partner(sell_leg, calls)
+        buy_leg = _find_balanced_partner(sell_leg, full_calls)
         if not buy_leg:
             return None
         return Signal(
@@ -350,8 +399,8 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             description=(
                 f"做多偏斜 {currency} {dte}d: "
                 f"卖 {sell_leg.instrument} + 买 {buy_leg.instrument} "
-                f"(Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, "
-                f"Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, Put偏贵)"
+                f"(Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg, 'sell')}, "
+                f"Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg, 'buy')}, Put偏贵)"
             ),
             legs=[
                 {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
@@ -370,7 +419,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not calls or not puts:
             return None
         sell_leg = calls[0]
-        buy_leg = _find_balanced_partner(sell_leg, puts)
+        buy_leg = _find_balanced_partner(sell_leg, full_puts)
         if not buy_leg:
             return None
         return Signal(
@@ -380,8 +429,8 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             description=(
                 f"做空偏斜 {currency} {dte}d: "
                 f"卖 {sell_leg.instrument} + 买 {buy_leg.instrument} "
-                f"(Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, "
-                f"Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, Call偏贵)"
+                f"(Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg, 'sell')}, "
+                f"Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg, 'buy')}, Call偏贵)"
             ),
             legs=[
                 {"instrument": sell_leg.instrument, "direction": "sell", "amount": 1},
@@ -400,7 +449,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not puts or not calls:
             return None
         buy_leg = puts[0]
-        sell_leg = _find_balanced_partner(buy_leg, calls)
+        sell_leg = _find_balanced_partner(buy_leg, full_calls)
         if not sell_leg:
             return None
         return Signal(
@@ -410,8 +459,8 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             description=(
                 f"做空偏斜 {currency} {dte}d: "
                 f"买 {buy_leg.instrument} + 卖 {sell_leg.instrument} "
-                f"(Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, "
-                f"Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, Put偏低)"
+                f"(Put Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg, 'buy')}, "
+                f"Call Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg, 'sell')}, Put偏低)"
             ),
             legs=[
                 {"instrument": buy_leg.instrument, "direction": "buy", "amount": 1},
@@ -430,7 +479,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
         if not calls or not puts:
             return None
         buy_leg = calls[0]
-        sell_leg = _find_balanced_partner(buy_leg, puts)
+        sell_leg = _find_balanced_partner(buy_leg, full_puts)
         if not sell_leg:
             return None
         return Signal(
@@ -440,8 +489,8 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
             description=(
                 f"做多偏斜 {currency} {dte}d: "
                 f"买 {buy_leg.instrument} + 卖 {sell_leg.instrument} "
-                f"(Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg)}, "
-                f"Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg)}, Call偏低)"
+                f"(Call Z={buy_leg.z_score:.1f} Δ={_fmt_delta(buy_leg, 'buy')}, "
+                f"Put Z={sell_leg.z_score:.1f} Δ={_fmt_delta(sell_leg, 'sell')}, Call偏低)"
             ),
             legs=[
                 {"instrument": buy_leg.instrument, "direction": "buy", "amount": 1},
@@ -492,7 +541,7 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None):
                 f"{wing_act} {left_wing.instrument} + {wing_act} {right_wing.instrument} "
                 f"+ {body_act} 2x {body.instrument} "
                 f"(左翼Z={left_wing.z_score:.1f} 右翼Z={right_wing.z_score:.1f} "
-                f"body Δ={abs(body.delta):.2f})"
+                f"body Δ={(body.delta if body_act == 'buy' else -body.delta):+.2f})"
             ),
             legs=[
                 {"instrument": left_wing.instrument, "direction": wing_act, "amount": 1},

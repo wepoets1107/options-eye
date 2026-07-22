@@ -72,11 +72,11 @@ class NotificationManager:
         COOLDOWN_SEC = 4 * 3600  # 4 小时冷却
 
         async with self._push_lock:
-            # 每 8 小时最多一次合并推送（锁内判断，避免并发重复）
+            # 每 4 小时最多一次合并推送（锁内判断，避免并发重复）
             batch_key = "sabr_batch"
             last_ts = last_push_ts(batch_key)
             if time.time() - last_ts < COOLDOWN_SEC:
-                logger.info(f"SABR 合并推送距上次不足 8 小时，跳过")
+                logger.info(f"SABR 合并推送距上次不足 4 小时，跳过")
                 return 0
 
             # 筛选当天未推过的 high/medium 信号（含进程内缓存防并发 + 跨周期模糊去重）

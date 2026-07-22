@@ -1,5 +1,14 @@
 # 期权天眼 更新日志
 
+## 0.20.0 (2026-07-22) 信号 delta 改显持仓符号 + 配对放宽到全合约
+
+岛主指出：做空偏斜（买 Put + 卖 Call）两腿持仓 Delta 都应为负，但信号里 Put Δ=0.19、Call Δ=0.08 都显正值，未体现持仓方向；且配对只在 oi 过滤后的偏差池里找对称腿，导致主腿 delta 0.19 却配到 delta 0.08 的远 OTM Call（中间 delta 接近 0.19 的 Call 因 oi 不足被池子剔除）。
+
+### 修改
+- `strategy/detector.py`：`_fmt_delta(d, action)` 改为按买卖方向显示**持仓 Delta**（买=与期权原生符号同向、卖=反向；call + / put −），买 Put→负、卖 Call→负，两条腿都正确显负；做多偏斜（买 Call + 卖 Put）则都显正。strangle / butterfly 同步带符号。
+- 新增 `_build_full_pool(kind)`：用该到期日**全合约链**（`slice_.calls`/`slice_.puts`，delta 在 [delta_min,delta_max]，不再限 oi）现算 z_score 构建配对池；`_find_balanced_partner` 改为从全合约池找对称腿，并把 `delta_min/delta_max` 透传进 `_build_signal`。之前因 oi<10 被剔除的对称腿现在能配到，delta 不再失衡。
+- version 0.19.0 → 0.20.0。
+
 ## 0.19.0 (2026-07-21) 收紧 WebSocket 并发 + 修复 ticker 重连风暴
 
 岛主指出 ticker 连接数需严格控制（≤2），且 WebSocket 订阅易触发 Deribit 限流，要求全局并发不超过 3 个。排查发现：当时实际只有 2 个 WS 连接（控制 1 + ticker 1，已 ≤3），日志里的"批次 2/8"是订阅分批轮转而非连接数；真正导致 429 刷屏的是**重连风暴**——ticker 连接被拒后仅 sleep(3) 即无限重连，维护期可能累积多个重连协程并发握手，反而把限流打得更死。
