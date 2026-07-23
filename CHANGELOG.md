@@ -1,5 +1,14 @@
 # 期权天眼 更新日志
 
+## 0.20.1 (2026-07-23) 配对纯按 Delta 对称 + 蝴蝶两翼 Delta 平衡
+
+岛主指出做多偏斜信号再次出现 delta 失衡（Call Δ=+0.22 配 Put Δ=+0.08）。排查发现 v0.20.0 只把配对搜索范围放宽到全合约、没动评分公式，`_find_balanced_partner` 仍用 `abs_diff*0.7 + abs_z*0.3` 打分，Z 权重让"无偏离但 delta 差很远"的腿击败"delta 对称但有偏离"的腿。蝴蝶式两翼此前各自按 Z 最高独立选取，根本未做 delta 对称，且描述不展示翼 delta，无法察觉。
+
+### 修改
+- `strategy/detector.py`：`_find_balanced_partner` 评分去掉 Z 权重，改为纯按 `abs(|Δ_opp| - |Δ_primary|)` 最小选对称腿。6 种 skew 分支 + overpriced/underpriced 的 risk_reversal/strangle 配对全部受益，不再出现 delta 失衡。
+- `strategy/detector.py`：butterfly（convex/concave）两翼改为 Delta 对称——以偏离更大的那翼为锚，去对侧全合约池找 |Δ| 最接近的翼；无对称翼时兜底退回各取最高 Z（不丢信号）。描述新增 `左翼Δ / 右翼Δ` 展示，便于核对两翼平衡。
+- version 0.20.0 → 0.20.1。
+
 ## 0.20.0 (2026-07-22) 信号 delta 改显持仓符号 + 配对放宽到全合约
 
 岛主指出：做空偏斜（买 Put + 卖 Call）两腿持仓 Delta 都应为负，但信号里 Put Δ=0.19、Call Δ=0.08 都显正值，未体现持仓方向；且配对只在 oi 过滤后的偏差池里找对称腿，导致主腿 delta 0.19 却配到 delta 0.08 的远 OTM Call（中间 delta 接近 0.19 的 Call 因 oi 不足被池子剔除）。

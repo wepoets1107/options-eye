@@ -294,18 +294,16 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None, delta_min=0.05
     full_puts = _build_full_pool("put")
 
     def _find_balanced_partner(primary, all_opposite):
-        """找与主腿 Delta 对称的辅腿（不限制 Z 正负）"""
+        """找与主腿 |Delta| 最接近的辅腿（纯 Delta 对称，不掺 Z 权重）"""
         target_abs_delta = abs(primary.delta)
         best = None
-        best_score = 999
+        best_diff = 999
         for c in all_opposite:
             if c.instrument == primary.instrument:
                 continue
             abs_diff = abs(abs(c.delta) - target_abs_delta)
-            abs_z = abs(c.z_score)
-            score = abs_diff * 0.7 + abs_z * 0.3
-            if score < best_score:
-                best_score = score
+            if abs_diff < best_diff:
+                best_diff = abs_diff
                 best = c
         return best
 
@@ -506,13 +504,24 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None, delta_min=0.05
         # Butterfly: 两翼（OTM call + OTM put）+ body（ATM）
         # convex → Short Butterfly（卖两翼 + 买 body），赚取曲率回归
         # concave → Long Butterfly（买两翼 + 卖 body）
-        wing_calls = sorted([d for d in devs if d.kind == "call" and abs(d.delta) < 0.15], key=lambda x: -x.z_score)
-        wing_puts = sorted([d for d in devs if d.kind == "put" and abs(d.delta) < 0.15], key=lambda x: -x.z_score)
+        wing_calls = [d for d in devs if d.kind == "call" and abs(d.delta) < 0.15]
+        wing_puts = [d for d in devs if d.kind == "put" and abs(d.delta) < 0.15]
         if not wing_calls or not wing_puts:
             return None
-        # 两翼：各取 Z 最高的合约
-        left_wing = wing_puts[0]   # OTM Put
-        right_wing = wing_calls[0] # OTM Call
+        # 两翼必须 Delta 对称：以偏离更大的那翼为锚，去对侧全合约池找 |Δ| 最接近的翼
+        all_wings = wing_calls + wing_puts
+        anchor = max(all_wings, key=lambda x: abs(x.z_score))
+        opp_pool = full_calls if anchor.kind == "put" else full_puts
+        opp_wings = [c for c in opp_pool if abs(c.delta) < 0.15 and c.instrument != anchor.instrument]
+        sym = _find_balanced_partner(anchor, opp_wings) if opp_wings else None
+        if sym is None:
+            # 兜底：无对称翼可配时退回各取最高 Z（尽量不丢信号）
+            left_wing = max(wing_puts, key=lambda x: abs(x.z_score))
+            right_wing = max(wing_calls, key=lambda x: abs(x.z_score))
+        elif anchor.kind == "put":
+            left_wing, right_wing = anchor, sym
+        else:
+            right_wing, left_wing = anchor, sym
 
         # body：从 slice_ 中找 Delta 最接近 0.5 的 ATM 合约
         atm_cands = [c for c in (slice_.calls or []) if 0.35 <= abs(c.delta) <= 0.55] + \
@@ -540,7 +549,8 @@ def _build_signal(pattern, devs, slice_, log_mid, now, sabr=None, delta_min=0.05
                 f"{'做空' if dir_ == 'short' else '做多'}曲率 {currency} {dte}d: "
                 f"{wing_act} {left_wing.instrument} + {wing_act} {right_wing.instrument} "
                 f"+ {body_act} 2x {body.instrument} "
-                f"(左翼Z={left_wing.z_score:.1f} 右翼Z={right_wing.z_score:.1f} "
+                f"(左翼Δ={left_wing.delta:+.2f} 右翼Δ={right_wing.delta:+.2f} "
+                f"左翼Z={left_wing.z_score:.1f} 右翼Z={right_wing.z_score:.1f} "
                 f"body Δ={(body.delta if body_act == 'buy' else -body.delta):+.2f})"
             ),
             legs=[
