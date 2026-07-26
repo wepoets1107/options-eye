@@ -193,6 +193,27 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Ping
       </div>
     </div>
 
+    <!-- VRP 反转信号 (W1 / Wasserstein 风险中性分布位移) -->
+    <div class="card" id="vrp-card">
+      <div class="card-header">VRP 反转信号
+        <span style="font-weight:400;color:#9aa6ba;">W1 / Wasserstein · RND 位移</span>
+        <span id="vrp-status" style="margin-left:auto;font-weight:400;color:#9aa6ba;"></span>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;gap:6px;margin-bottom:10px;">
+          <button class="heatmap-btn active" onclick="switchW1Curr('BTC')" id="w1-btc">BTC</button>
+          <button class="heatmap-btn" onclick="switchW1Curr('ETH')" id="w1-eth">ETH</button>
+        </div>
+        <div id="vrp-signal-body">
+          <div style="text-align:center;padding:16px;color:#9aa6ba;">等待数据...</div>
+        </div>
+        <div style="margin-top:14px;font-size:13px;color:#44506a;font-weight:600;">W1 时间序列（环比上一帧）</div>
+        <div style="position:relative;height:180px;"><canvas id="vrp-w1-chart"></canvas></div>
+        <div style="margin-top:14px;font-size:13px;color:#44506a;font-weight:600;">RND 形状对比（今 vs 上一帧 · 30D）</div>
+        <div style="position:relative;height:200px;"><canvas id="vrp-rnd-chart"></canvas></div>
+      </div>
+    </div>
+
     <!-- 策略持仓管理 -->
     <div class="card" id="positions-card">
       <div class="card-header">
@@ -308,12 +329,13 @@ function fmtBJT(ts){
 
 async function fetchData() {
   try {
-    var [stat, slices, devs, signals, expiry] = await Promise.all([
+    var [stat, slices, devs, signals, expiry, w1] = await Promise.all([
       fetch('/api/status').then(function(r) { return r.json(); }),
       fetch('/api/slices').then(function(r) { return r.json(); }),
       fetch('/api/deviations').then(function(r) { return r.json(); }),
       fetch('/api/signals').then(function(r) { return r.json(); }),
       fetch('/api/expiry').then(function(r) { return r.json(); }),
+      fetch('/api/w1_state').then(function(r) { return r.json(); }),
     ]);
 
     document.getElementById('stat-slices').textContent = stat.slices;
@@ -345,6 +367,7 @@ async function fetchData() {
     renderHeatmap();
     renderSignals();
     renderExpiry(expiry);
+    renderW1(w1);
 
     // 交易凭证状态（自动恢复提示，仅首次设置避免每 3s 覆盖已保存的状态）
     var credEl = document.getElementById('cred-status');
@@ -453,6 +476,140 @@ function renderExpiry(d) {
     else if (d.status === 'no_expiry_options') stEl.textContent = '无末日期权';
     else if (d.status === 'expiry_passed') stEl.textContent = '无临近到期';
     else stEl.textContent = '';
+  }
+}
+
+// ---- VRP 反转信号 (W1 / Wasserstein) ----
+var w1Data = null;
+var w1Curr = 'BTC';
+var w1Chart = null;
+var rndChart = null;
+
+function fmtUTC(ts) {
+  if (!ts) return '--';
+  var d = new Date(ts * 1000);
+  var p = function(n){ return String(n).padStart(2, '0'); };
+  return p(d.getUTCMonth()+1) + '-' + p(d.getUTCDate()) + ' ' + p(d.getUTCHours()) + ':' + p(d.getUTCMinutes());
+}
+
+function switchW1Curr(c) {
+  w1Curr = c;
+  document.getElementById('w1-btc').classList.toggle('active', c === 'BTC');
+  document.getElementById('w1-eth').classList.toggle('active', c === 'ETH');
+  if (w1Data) renderW1(w1Data);
+}
+
+function renderW1(d) {
+  w1Data = d;
+  var statusEl = document.getElementById('vrp-status');
+  var box = document.getElementById('vrp-signal-body');
+  if (!d || !d.updated_ts) {
+    box.innerHTML = '<div style="text-align:center;padding:16px;color:#9aa6ba;">等待数据...</div>';
+    if (statusEl) statusEl.textContent = '';
+    return;
+  }
+  if (statusEl) {
+    statusEl.textContent = d.status === 'no_data' ? '无 SABR 数据' : ('更新 ' + (d.updated_at || '--'));
+  }
+
+  var cur = w1Curr;
+  var w1c = (d.w1 && d.w1[cur]) || null;
+  var trig = (d.trigger && d.trigger.details && d.trigger.details[cur]) || null;
+  var thr = (d.trigger && d.trigger.threshold) || null;
+  var snap = (d.snapshot_count && d.snapshot_count[cur]) || {};
+
+  function has(x){ return x !== undefined && x !== null && !Number.isNaN(Number(x)); }
+  function num(x, dec){ dec = dec || 4; return has(x) ? Number(x).toLocaleString(undefined, {maximumFractionDigits: dec}) : '--'; }
+
+  // —— 信号状态卡片 ——
+  var sigOn = trig && trig.ok;
+  var sigColor = sigOn ? '#c0392b' : (d.signal ? '#e08e0b' : '#9aa6ba');
+  var sigText = sigOn ? '触发 · VRP 反转' : (d.signal ? '部分币种触发' : '未触发');
+  var t30 = w1c ? (w1c['30'] || {}) : {};
+  var t7 = w1c ? (w1c['7'] || {}) : {};
+  var w30 = (t30.w1 && t30.w1['1'] != null) ? t30.w1['1'] : null;
+  var w7 = (t7.w1 && t7.w1['1'] != null) ? t7.w1['1'] : null;
+  var type30 = t30.type || '--';
+  var type7 = t7.type || '--';
+  var jr30 = (t30.jump_ratio != null) ? t30.jump_ratio : null;
+
+  function row(label, val, sub, color) {
+    return '<div style="display:flex;justify-content:space-between;align-items:baseline;font-size:13px;padding:4px 0;border-bottom:1px solid #f0f2f6;">'
+         + '<span style="color:#65718a;">' + label + '</span>'
+         + '<span style="font-variant-numeric:tabular-nums;text-align:right;">'
+         + '<b style="color:' + (color || '#1f2d44') + ';">' + val + '</b>'
+         + (sub ? ' <span style="color:#9aa6ba;font-size:12px;">' + sub + '</span>' : '')
+         + '</span></div>';
+  }
+  var t30c = type30 === 'jump' ? '#1b9e57' : (type30 === 'trend' ? '#c0392b' : '#9aa6ba');
+  var t7c = type7 === 'jump' ? '#1b9e57' : (type7 === 'trend' ? '#c0392b' : '#9aa6ba');
+  var earlyOk = (w7 != null && type7 === 'jump');
+  var html = '';
+  html += '<div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">'
+        + '<span style="font-size:18px;font-weight:800;color:' + sigColor + ';">' + sigText + '</span>'
+        + (thr != null ? '<span style="font-size:12px;color:#65718a;">阈值 ' + num(thr, 4) + '</span>' : '')
+        + '</div>';
+  html += row('30D 主哨 W1(1d)', num(w30), type30, t30c);
+  html += row('7D 早哨 W1(1d)', num(w7), type7, t7c);
+  html += row('7D 确认', earlyOk ? '是' : '否', '双 tenor 同跳才信', earlyOk ? '#1b9e57' : '#9aa6ba');
+  html += row('jump 比率(7d/1d)', jr30 != null ? num(jr30, 3) : '--', '≈1 jump / ≫1 trend', jr30 != null && jr30 <= 2.5 ? '#1b9e57' : '#c0392b');
+  html += row('快照帧数(30D/7D)', (snap['30'] || 0) + ' / ' + (snap['7'] || 0), '', '#44506a');
+  html += '<div style="font-size:11px;color:#aab4c4;margin-top:8px;">' + (d.note || '') + '</div>';
+  box.innerHTML = html;
+
+  // —— W1 时间序列折线 ——
+  var ser = (d.w1_series && d.w1_series[cur]) || {};
+  var s30 = (ser['30'] || []).filter(function(p){ return p.w1 != null; }).map(function(p){ return {x: p.ts, y: p.w1}; });
+  var s7 = (ser['7'] || []).filter(function(p){ return p.w1 != null; }).map(function(p){ return {x: p.ts, y: p.w1}; });
+  var w1Cfg = {
+    type: 'line',
+    data: { datasets: [
+      { label: '30D 主哨', data: s30, borderColor: '#2f6df6', backgroundColor: 'rgba(47,109,246,.08)', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: true },
+      { label: '7D 早哨', data: s7, borderColor: '#e08e0b', backgroundColor: 'rgba(224,142,11,.06)', borderWidth: 1.5, pointRadius: 0, tension: 0.2, fill: true },
+    ]},
+    options: {
+      responsive: true, maintainAspectRatio: false, animation: false,
+      interaction: { mode: 'nearest', intersect: false },
+      scales: {
+        x: { type: 'linear', ticks: { color: '#65718a', maxTicksLimit: 6, callback: function(v){ return fmtUTC(v).split(' ')[1] || v; } }, grid: { color: '#eef1f5' } },
+        y: { ticks: { color: '#65718a' }, grid: { color: '#eef1f5' }, title: { display: true, text: 'W1', color: '#9aa6ba' } }
+      },
+      plugins: {
+        legend: { labels: { color: '#44506a', boxWidth: 12 } },
+        tooltip: { callbacks: { title: function(items){ return items.length ? fmtUTC(items[0].parsed.x) : ''; } } }
+      }
+    }
+  };
+  if (w1Chart) { w1Chart.data = w1Cfg.data; w1Chart.update(); }
+  else { var wctx = document.getElementById('vrp-w1-chart'); if (wctx) w1Chart = new Chart(wctx, w1Cfg); }
+
+  // —— RND 形状对比（今 vs 昨 · 30D） ——
+  var rc = (d.rnd_compare && d.rnd_compare[cur] && d.rnd_compare[cur]['30']);
+  if (rc) {
+    var x = rc.x;
+    var dn = x.map(function(v, i){ return {x: v, y: rc.pdf_now[i]}; });
+    var dp = x.map(function(v, i){ return {x: v, y: rc.pdf_prev[i]}; });
+    var rndCfg = {
+      type: 'line',
+      data: { datasets: [
+        { label: '今 F=' + num(rc.F_now, 0), data: dn, borderColor: '#2f6df6', borderWidth: 1.8, pointRadius: 0, tension: 0.25 },
+        { label: '上一帧 F=' + num(rc.F_prev, 0), data: dp, borderColor: '#e5484d', borderWidth: 2.0, pointRadius: 0, tension: 0.25 },
+      ]},
+      options: {
+        responsive: true, maintainAspectRatio: false, animation: false,
+        interaction: { mode: 'nearest', intersect: false },
+        scales: {
+          x: { type: 'linear', ticks: { color: '#65718a', maxTicksLimit: 8, callback: function(v){ return Number(v).toFixed(2); } }, grid: { color: '#eef1f5' }, title: { display: true, text: 'log-moneyness ln(K/F)', color: '#9aa6ba' } },
+          y: { ticks: { color: '#65718a' }, grid: { color: '#eef1f5' }, title: { display: true, text: '密度', color: '#9aa6ba' } }
+        },
+        plugins: { legend: { labels: { color: '#44506a', boxWidth: 12 } } }
+      }
+    };
+    if (rndChart) { rndChart.data = rndCfg.data; rndChart.update(); }
+    else { var rctx = document.getElementById('vrp-rnd-chart'); if (rctx) rndChart = new Chart(rctx, rndCfg); }
+  } else if (rndChart) {
+    rndChart.data.datasets = [];
+    rndChart.update();
   }
 }
 

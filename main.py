@@ -23,6 +23,7 @@ from strategy.detector import detect_deviations, generate_signals
 from notification.notifier import NotificationManager
 from notification.bnb_client import RollingMarket, BinanceFuturesClient
 from notification.expiry_scorer import ExpiryScorer, fmt_ts
+from strategy.w1_vrp import compute_w1_state, _load_history
 
 logger = logging.getLogger(__name__)
 
@@ -337,6 +338,33 @@ async def expiry_eval_loop(web_state: dict):
         await asyncio.sleep(15)  # 每15秒评估一次
 
 
+async def w1_loop(web_state: dict):
+    """VRP 反转信号(W1)后台循环 — 纯只读旁路，复用 web_state 中现有 SABR 参数与期权链快照，
+    不调用任何 DeribitWS 网络方法，零新增 WebSocket / 订阅。"""
+    cfg = web_state.get("config", {}).get("w1", {})
+    if not cfg.get("enabled", False):
+        logger.info("W1 VRP 模块未启用 (config w1.enabled=false)")
+        return
+    interval = int(cfg.get("eval_interval_sec", 60))
+    path = cfg.get("history_path", "data/w1_rnd_history.json")
+    # 启动时从磁盘恢复历史快照（防重启丢失）
+    if "w1_rnd_history" not in web_state:
+        web_state["w1_rnd_history"] = _load_history(path)
+    logger.info("W1 VRP 循环已启动 (eval_interval=%ds)", interval)
+    while True:
+        try:
+            now = time.time()
+            state = compute_w1_state(web_state, cfg, now)
+            web_state["w1_state"] = state
+            if state.get("signal"):
+                notif = web_state.get("notifier")
+                if notif:
+                    asyncio.create_task(notif.push_w1_signal(state))
+        except Exception as e:
+            logger.error(f"W1 循环异常: {e}", exc_info=True)
+        await asyncio.sleep(interval)
+
+
 async def main():
     config = load_config()
     setup_logging(config)
@@ -405,11 +433,23 @@ async def main():
     asyncio.create_task(bnb_client.run())
     logger.info("末日期权评分模块已初始化 (等待 Binance WS 数据积累)")
 
+    # 初始化 W1 VRP 反转信号模块（纯只读旁路，复用 web_state；历史快照落盘）
+    web_state["w1_state"] = {}
+    w1_cfg = config.get("w1", {})
+    web_state["w1_rnd_history"] = (
+        _load_history(w1_cfg.get("history_path", "data/w1_rnd_history.json"))
+        if w1_cfg.get("enabled") else {}
+    )
+    logger.info(f"W1 VRP 模块 {'已启用' if w1_cfg.get('enabled') else '未启用'}")
+
     # 启动主循环（后台）
     asyncio.create_task(main_loop(ws, config, web_state))
 
     # 启动末日期权评分（后台）
     asyncio.create_task(expiry_eval_loop(web_state))
+
+    # 启动 W1 VRP 反转信号（后台，纯只读旁路）
+    asyncio.create_task(w1_loop(web_state))
 
     # 启动 Web 服务器
     web_cfg = config.get("web", {})

@@ -69,3 +69,18 @@ logging:
   file: "logs/options-eye.log"
   max_size_mb: 10
   backup_count: 3
+
+# VRP 反转信号模块（W1 / Wasserstein on RND）
+# 纯只读旁路，复用主流程 IV 曲面/SABR 数据，不发起新 WebSocket
+w1:
+  enabled: true
+  tenors: [7, 30]               # 目标到期天数：30D 主哨 + 7D 早哨
+  lags_days: [1, 3, 7]          # 快照间隔（天）：k=1/3/7，用于 jump/trend 轮廓分类
+  snapshot_mode: hourly         # hourly=每整点(UTC)存一帧实时积累历史surface
+  snapshot_utc_hour: 0          # daily 模式基准 UTC 钟点
+  min_snapshot_gap_sec: 3500    # 整点模式防同整点窗口重复记帧的最小间隔
+  eval_interval_sec: 60         # 循环评估间隔
+  jump_ratio_threshold: 2.5     # ratio=W1(t,t-7)/W1(t,t-1) > 该值 判 trend 型丢弃
+  trigger_w1_min: 0.02          # 占位固定阈值（OOS 后改为样本分位 walk-forward 阈值）
+  history_path: "data/w1_rnd_history.json"
+  max_history_days: 120

@@ -166,6 +166,49 @@ class NotificationManager:
             logger.info(f"SABR 合并推送完成: {pushed_total}/{total} 条新信号")
             return pushed_total
 
+    async def push_w1_signal(self, state: dict) -> bool:
+        """推送 VRP 反转预警(W1) — 每天最多 2 次，仅 signal=true 时推"""
+        if not self.enabled or not state:
+            return False
+        if not state.get("signal"):
+            return False
+
+        key = "w1"
+        cnt = push_count_today(key)
+        if cnt >= 2:
+            logger.info(f"W1 信号当天已推送 {cnt} 次，达上限")
+            return False
+
+        body = self._format_w1_message(state)
+        ok = await self._dispatch(body, "[期权天眼] VRP反转预警")
+        if ok:
+            mark_pushed(key)
+            append_log({
+                "ts": int(time.time()),
+                "type": "w1_vrp",
+                "currencies": str(state.get("trigger", {}).get("currencies", [])),
+                "threshold": state.get("trigger", {}).get("threshold"),
+            })
+        return ok
+
+    def _format_w1_message(self, state: dict) -> str:
+        trig = state.get("trigger", {})
+        lines = ["【期权天眼】VRP反转预警 (W1 Wasserstein)", ""]
+        for cur in trig.get("currencies", []):
+            d = trig.get("details", {}).get(cur, {})
+            lines.append(f"币种: {cur}")
+            lines.append(f"  30D W1(1日)={d.get('w1_30')}  jump型={d.get('jump_30')}")
+            lines.append(f"  7D  W1(1日)={d.get('w1_7')}   jump型={d.get('jump_7')}")
+        lines.extend([
+            "",
+            "解释: 分布骤移(jump型)且 7D/30D 双确认，预示未来7日 realized 波动超 implied(VRP反转)",
+            "纪律: 仅研究信号，实盘需 M2 OOS 验证通过 + 岛主授权",
+            "━" * 16,
+            "不构成交易建议。",
+            "",
+        ])
+        return "\n".join(lines)
+
     def _format_sabr_batch(self, signals: list[dict], note: str = "") -> str:
         """将所有信号合并为一条消息（保持与单条推送一致的样式的精简版）"""
         title = "【期权天眼】SABR IV 曲面异常扫描"

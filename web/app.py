@@ -64,6 +64,8 @@ state = {
     "signal_status_overrides": {},   # signal_id -> confirmed/ignored（主循环重建 latest_signals 时回填）
     "runtime_params": {},            # 前端动态参数（min_dte/delta_min/delta_max/z_threshold/min_oi），覆盖 config 默认
     "version": "",                   # 由 main.py 注入（APP_VERSION）
+    "w1_state": {},                  # W1 VRP 反转信号状态（strategy/w1_vrp.py 写入）
+    "w1_rnd_history": {},            # RND 历史快照（w1_loop 维护，落盘 data/w1_rnd_history.json）
 }
 
 
@@ -248,6 +250,12 @@ async def api_signals():
 async def api_expiry():
     """获取末日期权买方信号评分快照（每轮评估都更新，未触发也返回实时分数）"""
     return state.get("expiry_state", {})
+
+
+@app.get("/api/w1_state")
+async def api_w1_state():
+    """获取 VRP 反转信号(W1 Wasserstein)状态：RND 元信息、各 tenor 的 W1/jump-trend、触发状态"""
+    return state.get("w1_state", {})
 
 
 @app.post("/api/credentials")

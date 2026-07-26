@@ -41,3 +41,14 @@ __pycache__/
 # 本机启动器（Windows 任务计划程序调用，不提交）
 start_service.bat
 start_service.ps1
+
+# W1 模块：运行时历史快照（每台机器独立积累，不提交）
+data/w1_rnd_history.json
+
+# 临时探测脚本 / research 产物（本地验证用，不提交）
+w1_ftest.py
+w1_research_synthesize.png
+
+# 本机停止器（与 start_service 同性质，含本机路径，不提交）
+stop_service.bat
+stop_service.ps1
